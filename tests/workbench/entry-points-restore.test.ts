@@ -1,0 +1,231 @@
+// @vitest-environment jsdom
+
+/**
+ * The three restored entry points, pinned:
+ *
+ *  1. the My courses page carries an upload control next to its name filter
+ *     (it imports a course package from disk into the library);
+ *  2. the Pro launch composer (and the chat composer) carries an attach
+ *     control in the glyph row, rendered exactly when the material upload
+ *     path can serve a request;
+ *  3. the rail's account menu, at its foot, carries the settings entry for the
+ *     model/provider dialog beside the language and theme controls.
+ *
+ * Items 1 and 3 are pinned from source (the rail and the shell are heavy
+ * client surfaces the suite renders nowhere else); item 2 is pinned by an
+ * actual render of `AttachButton` under both probe answers, plus source pins
+ * for where it is mounted and the copy it carries in every locale.
+ */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { act, createElement, type ReactNode } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const read = (path: string) => readFileSync(resolve(process.cwd(), path), 'utf8');
+
+vi.mock('@/components/ui/tooltip', () => ({
+  Tooltip: ({ children }: { children: ReactNode }) => children,
+  TooltipTrigger: ({ children }: { children: ReactNode }) => children,
+  TooltipContent: () => null,
+}));
+
+const hosts: Array<{ root: Root; host: HTMLDivElement }> = [];
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  for (const { root, host } of hosts.splice(0)) {
+    root.unmount();
+    host.remove();
+  }
+});
+
+/** Load a fresh module copy so the probe cache starts empty — the cache is
+ *  module-level and remembered for the life of the tab, exactly as in the app,
+ *  so one test's probe answer must not leak into the next. */
+async function importFreshExtras(): Promise<
+  typeof import('@/components/workbench/compose-extras')
+> {
+  vi.resetModules();
+  return await import('@/components/workbench/compose-extras');
+}
+
+function mount(children: ReactNode): Root {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  hosts.push({ root, host });
+  return root;
+}
+
+/** Flush the probe's fetch → json → state chain, then the re-render. */
+async function flushProbe() {
+  await act(async () => {
+    await new Promise((settle) => setTimeout(settle, 0));
+  });
+}
+
+describe('entry point 1 — the course upload control on My courses', () => {
+  const page = read('components/workbench/workspace/WorkspaceCoursesPage.tsx');
+  const shell = read('components/workbench/workspace/WorkspaceShell.tsx');
+  const discovery = read('lib/hooks/use-home-discovery.tsx');
+
+  it('renders the upload button in the page header, beside the name filter', () => {
+    const header = page.slice(page.indexOf('<header'), page.indexOf('</header>'));
+    expect(header).toContain('data-testid="workspace-courses-search"');
+    expect(header).toContain('data-testid="workspace-courses-import"');
+    expect(header).toContain('<Upload className="size-4"');
+  });
+
+  it('opens the same course-package import the home surface uses, disabled while one runs', () => {
+    const button = page.slice(
+      page.indexOf('data-testid="workspace-courses-import"'),
+      page.indexOf('data-testid="workspace-courses-new-folder"'),
+    );
+    expect(button).toContain('courses.triggerImport');
+    expect(button).toContain('disabled={courses.importing}');
+    expect(button).toContain("t('import.classroom')");
+  });
+
+  it('is no longer in the rail, which lists chats only', () => {
+    const rail = read('components/workbench/workspace/WorkspaceRail.tsx');
+    expect(rail).not.toContain('pro-nav-import-course');
+    expect(rail).not.toContain('role="tablist"');
+  });
+
+  it('mounts the hidden file input once, from the discovery hook the button calls', () => {
+    expect(shell).toContain('{courses.importInput}');
+    expect(discovery).toContain('triggerFileSelect');
+    expect(discovery).toContain('triggerImport');
+    expect(discovery).toContain('importing: isImporting');
+    expect(discovery).toContain('accept=".zip"');
+  });
+});
+
+describe('entry point 2 — the composer attach control', () => {
+  const extras = read('components/workbench/compose-extras.tsx');
+  const launch = read('components/workbench/ProLaunchPanel.tsx');
+  const chat = read('components/workbench/WorkbenchChat.tsx');
+
+  it('is mounted in the Pro launch composer’s glyph row, before the mention and skill', () => {
+    expect(launch).toContain('testId="pro-launch-attach"');
+    const row = launch.slice(launch.indexOf('pro-launch-attach'), launch.indexOf('<ProLaunchSend'));
+    expect(row).toContain('<AtSignButton');
+    expect(row).toContain('<SkillButton');
+  });
+
+  it('is mounted in the chat composer’s glyph row too', () => {
+    expect(chat).toContain('<AttachButton');
+    expect(chat).toContain('testId="workbench-attach"');
+  });
+
+  it('renders when the runtime says the upload path is live', async () => {
+    // The probe resolves to this branch's runtime `enabled` field — the same
+    // value that gates `POST /api/materials`, the upload action's precondition.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({ enabled: true, runtimeEnabled: true })),
+    );
+    const { AttachButton } = await importFreshExtras();
+    const root = mount(null);
+    await act(async () => {
+      root.render(createElement(AttachButton, { onFiles: () => undefined, label: 'attach' }));
+    });
+    await flushProbe();
+    const host = hosts[hosts.length - 1].host;
+    expect(host.querySelector('[data-testid="workbench-attach"]')).not.toBeNull();
+    expect(host.querySelector('input[type="file"]')).not.toBeNull();
+  });
+
+  it('stays hidden while the upload path is off (no dead button)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({ enabled: false })),
+    );
+    const { AttachButton } = await importFreshExtras();
+    const root = mount(null);
+    await act(async () => {
+      root.render(createElement(AttachButton, { onFiles: () => undefined, label: 'attach' }));
+    });
+    await flushProbe();
+    const host = hosts[hosts.length - 1].host;
+    expect(host.querySelector('[data-testid="workbench-attach"]')).toBeNull();
+  });
+
+  it('reads the runtime `enabled` field, this branch’s upload precondition', () => {
+    // The reference probes `materialsEnabled` (its runtime answers
+    // `enabled && isAgentMaterialsEnabled()`); this port has no separate
+    // materials flag, so the probe must read `enabled` — otherwise the button
+    // could never render.
+    expect(extras).toContain('(body as { enabled?: unknown }).enabled === true');
+    expect(extras).not.toContain('materialsEnabled === true');
+    expect(extras).not.toContain('materialsEnabled?: unknown');
+  });
+
+  it('carries the reference’s own copy in every locale', () => {
+    const expected: Record<string, string> = {
+      'ar-SA': 'إرفاق مواد',
+      'de-DE': 'Attach material',
+      'en-US': 'Attach material',
+      'es-MX': 'Adjuntar material',
+      'fr-FR': 'Joindre un support',
+      'ja-JP': '教材を添付',
+      'ko-KR': '자료 첨부',
+      'pt-BR': 'Anexar material',
+      'ru-RU': 'Прикрепить материал',
+      'vi-VN': 'Đính kèm tài liệu',
+      'zh-CN': '添加材料',
+      'zh-TW': '添加材料',
+    };
+    for (const [locale, copy] of Object.entries(expected)) {
+      const parsed = JSON.parse(read(`lib/i18n/locales/${locale}.json`)) as {
+        workspace?: { composer?: { attach?: string } };
+      };
+      expect(parsed.workspace?.composer?.attach, locale).toBe(copy);
+    }
+  });
+});
+
+describe('entry point 3 — the settings entry in the rail’s account menu', () => {
+  const rail = read('components/workbench/workspace/WorkspaceRail.tsx');
+  const account = read('components/workbench/workspace/WorkspaceAccount.tsx');
+
+  it('mounts the account block, whose menu carries settings, in the expanded foot', () => {
+    const foot = rail.slice(rail.indexOf('data-testid="pro-rail-utilities"'));
+    expect(foot).toContain(
+      '<WorkspaceAccountBlock onOpenSettings={onOpenSettings} onOpenGuide={onOpenGuide} />',
+    );
+    expect(account).toContain('data-testid="workspace-account-settings"');
+    expect(account).toContain('onSelect={onOpenSettings}');
+  });
+
+  it('keeps it on the collapsed strip too', () => {
+    const mini = rail.slice(
+      rail.indexOf('pro-rail-utilities-mini'),
+      rail.indexOf('renderCourseRow'),
+    );
+    expect(mini).toContain(
+      '<WorkspaceAccountBlock mini onOpenSettings={onOpenSettings} onOpenGuide={onOpenGuide} />',
+    );
+  });
+
+  it('opens the model/provider dialog, mounted by the shell for the rail and the search', () => {
+    const shell = read('components/workbench/workspace/WorkspaceShell.tsx');
+    expect(shell).toContain("import { SettingsDialog } from '@/components/settings'");
+    expect(shell).toContain(
+      '<SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />',
+    );
+    expect(shell).toContain('onOpenSettings={() => setSettingsOpen(true)}');
+  });
+
+  it('sits with the language and theme controls in the menu', () => {
+    const order = [
+      'workspace-account-settings',
+      'workspace-account-language',
+      'workspace-account-theme',
+    ].map((token) => account.indexOf(token));
+    for (const index of order) expect(index).toBeGreaterThan(-1);
+    expect(order[0]).toBeLessThan(order[1]);
+    expect(order[1]).toBeLessThan(order[2]);
+  });
+});

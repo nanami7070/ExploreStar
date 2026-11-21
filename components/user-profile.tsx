@@ -1,0 +1,326 @@
+'use client';
+
+import { useCallback, useState, useEffect, useRef } from 'react';
+import { Pencil, Check, ImagePlus, ChevronDown } from 'lucide-react';
+import { AnimatePresence, motion } from 'motion/react';
+import { Card } from '@/components/ui/card';
+import { Textarea } from '@/components/ui/textarea';
+import { cn } from '@/lib/utils';
+import { useI18n } from '@/lib/hooks/use-i18n';
+import { toast } from 'sonner';
+import { useUserProfileStore, AVATAR_OPTIONS } from '@/lib/store/user-profile';
+
+/** Check whether avatar is a custom upload (data-URL) */
+function isCustomAvatar(avatar: string) {
+  return avatar.startsWith('data:');
+}
+
+/** Max uploaded image size before we reject */
+const MAX_AVATAR_SIZE = 5 * 1024 * 1024; // 5 MB
+
+const FILE_INPUT_ID = 'user-avatar-upload';
+
+/** The selected avatar: a box-shadow ring outside the tile, so nothing in the row moves. */
+const AVATAR_SELECTED_RING =
+  'ring-2 ring-violet-400 dark:ring-violet-500 ring-offset-1 ring-offset-popover';
+
+/**
+ * Turn a picked image file into the stored avatar: a 128px, centre-cropped
+ * JPEG data-URL. Resolves null (after saying why) for a file that is too large
+ * or not an image.
+ */
+export function readAvatarUpload(file: File, t: (key: string) => string): Promise<string | null> {
+  if (file.size > MAX_AVATAR_SIZE) {
+    toast.error(t('profile.fileTooLarge'));
+    return Promise.resolve(null);
+  }
+  if (!file.type.startsWith('image/')) {
+    toast.error(t('profile.invalidFileType'));
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 128;
+        const ctx = canvas.getContext('2d')!;
+        const scale = Math.max(128 / img.width, 128 / img.height);
+        const w = img.width * scale;
+        const h = img.height * scale;
+        ctx.drawImage(img, (128 - w) / 2, (128 - h) / 2, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.85));
+      };
+      img.onerror = () => resolve(null);
+      img.src = reader.result as string;
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+}
+
+/** How long typing in the bio settles before it is saved. */
+export const PROFILE_BIO_SAVE_DELAY_MS = 500;
+
+/**
+ * The learner profile editor: avatar (presets or an upload, from the chevron
+ * on the avatar), the name (text until pressed, then a field; saved on Enter
+ * or leaving it) with its hint, and the bio (saved once typing settles, on
+ * leaving it, and when the editor goes away). It saves itself — there is no
+ * button — and reports each save through `onSaved`.
+ *
+ * `className` adjusts the card's surface for the host it sits in (the account
+ * menu supplies its own).
+ */
+export function UserProfileCard({
+  className,
+  onSaved,
+}: { readonly className?: string; readonly onSaved?: () => void } = {}) {
+  const { t } = useI18n();
+  const avatar = useUserProfileStore((s) => s.avatar);
+  const nickname = useUserProfileStore((s) => s.nickname);
+  const bio = useUserProfileStore((s) => s.bio);
+  const setAvatar = useUserProfileStore((s) => s.setAvatar);
+  const setNickname = useUserProfileStore((s) => s.setNickname);
+  const setBio = useUserProfileStore((s) => s.setBio);
+
+  const [bioDraft, setBioDraft] = useState(bio);
+  const bioPending = useRef<string | null>(null);
+  const bioTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const savedRef = useRef(onSaved);
+  useEffect(() => {
+    savedRef.current = onSaved;
+  });
+  const flushBio = useCallback(() => {
+    if (bioTimer.current) clearTimeout(bioTimer.current);
+    bioTimer.current = null;
+    const next = bioPending.current;
+    bioPending.current = null;
+    if (next === null) return;
+    setBio(next);
+    savedRef.current?.();
+  }, [setBio]);
+  // Leaving (the menu closing, a page change) must not lose typing.
+  useEffect(() => flushBio, [flushBio]);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+  const [avatarPickerOpen, setAvatarPickerOpen] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setHydrated(true); // eslint-disable-line react-hooks/set-state-in-effect -- Store hydration on mount
+  }, []);
+
+  useEffect(() => {
+    if (editingName) nameInputRef.current?.focus();
+  }, [editingName]);
+
+  const displayName = nickname || t('profile.defaultNickname');
+
+  const startEditName = () => {
+    setNameDraft(nickname);
+    setEditingName(true);
+  };
+
+  const commitName = () => {
+    if (nameDraft.trim() !== nickname) {
+      setNickname(nameDraft.trim());
+      onSaved?.();
+    }
+    setEditingName(false);
+  };
+  const pickAvatar = (next: string) => {
+    setAvatar(next);
+    onSaved?.();
+  };
+
+  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    void readAvatarUpload(file, t).then((avatar) => {
+      if (avatar) pickAvatar(avatar);
+    });
+  };
+
+  if (!hydrated) {
+    return (
+      <Card
+        className={cn(
+          'p-5 !gap-0 shadow-xl border-muted/40 backdrop-blur-xl bg-white/80 dark:bg-slate-900/80',
+          className,
+        )}
+      >
+        <div className="flex items-center gap-3">
+          <div className="size-11 rounded-full bg-muted animate-pulse" />
+          <div className="flex-1 space-y-2">
+            <div className="h-3 w-16 rounded bg-muted animate-pulse" />
+            <div className="h-4 w-24 rounded bg-muted animate-pulse" />
+          </div>
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <Card
+      className={cn(
+        'p-5 !gap-0 shadow-xl border-muted/40 backdrop-blur-xl bg-white/80 dark:bg-slate-900/80',
+        className,
+      )}
+    >
+      {/* File input — sr-only keeps it in the flow but invisible; label triggers it */}
+      <input
+        id={FILE_INPUT_ID}
+        type="file"
+        accept="image/*"
+        className="sr-only"
+        onChange={handleAvatarUpload}
+      />
+
+      {/* Row 1: Avatar + Name */}
+      <div className="flex items-center gap-3.5">
+        {/* Avatar — click to toggle picker */}
+        <button
+          onClick={() => setAvatarPickerOpen(!avatarPickerOpen)}
+          className="shrink-0 group/avatar relative cursor-pointer"
+        >
+          <div
+            data-profile-avatar=""
+            className="size-11 rounded-full bg-gray-50 dark:bg-gray-800 overflow-hidden ring-2 ring-violet-300/50 dark:ring-violet-600/40 group-hover/avatar:ring-violet-400 dark:group-hover/avatar:ring-violet-500 transition-all"
+          >
+            <img src={avatar} alt="" className="size-full object-cover" />
+          </div>
+          <div className="absolute -bottom-0.5 -right-0.5 size-4 rounded-full bg-white dark:bg-slate-800 border border-muted/60 flex items-center justify-center">
+            <ChevronDown
+              className={cn(
+                'size-2.5 text-muted-foreground transition-transform duration-200',
+                avatarPickerOpen && 'rotate-180',
+              )}
+            />
+          </div>
+        </button>
+
+        {/* Name */}
+        <div className="flex-1 min-w-0">
+          {editingName ? (
+            <div className="flex items-center gap-1.5">
+              <input
+                ref={nameInputRef}
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitName();
+                  if (e.key === 'Escape') setEditingName(false);
+                }}
+                onBlur={commitName}
+                maxLength={20}
+                placeholder={t('profile.defaultNickname')}
+                data-profile-name=""
+                className="flex-1 min-w-0 h-7 bg-transparent border-b-2 border-violet-400 dark:border-violet-500 text-sm font-semibold text-foreground outline-none placeholder:text-muted-foreground/40"
+              />
+              <button
+                onClick={commitName}
+                className="shrink-0 size-6 rounded-md flex items-center justify-center text-violet-500 hover:bg-violet-100 dark:hover:bg-violet-900/30 transition-colors"
+              >
+                <Check className="size-3.5" />
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={startEditName}
+              // Room on the right for the host's "Saved" tick and collapse button.
+              className="group/name flex max-w-[calc(100%-4.5rem)] items-center gap-1.5 cursor-pointer"
+            >
+              <span
+                data-profile-name=""
+                className="min-w-0 text-sm font-semibold text-foreground truncate"
+              >
+                {displayName}
+              </span>
+              <Pencil className="size-3 shrink-0 text-muted-foreground/40 opacity-0 group-hover/name:opacity-100 transition-opacity" />
+            </button>
+          )}
+          <p
+            data-profile-hint=""
+            title={t('profile.avatarHint')}
+            className="truncate text-[10px] text-muted-foreground/50 mt-0.5"
+          >
+            {t('profile.avatarHint')}
+          </p>
+        </div>
+      </div>
+
+      {/* Avatar picker — collapsible */}
+      <AnimatePresence>
+        {avatarPickerOpen && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2, ease: 'easeInOut' }}
+            // The clip stands 4px past the content so a selected ring and a hover
+            // scale are not cut; the grid itself keeps the bio's left and right.
+            className="-mx-1 overflow-hidden px-1"
+          >
+            <div data-profile-avatars="" className="grid grid-cols-8 gap-1 pb-1 pt-3">
+              {AVATAR_OPTIONS.map((url) => (
+                <button
+                  key={url}
+                  onClick={() => pickAvatar(url)}
+                  className={cn(
+                    'aspect-square w-full overflow-hidden rounded-full bg-gray-50 dark:bg-gray-800 cursor-pointer transition-all duration-150',
+                    'hover:scale-110 active:scale-95',
+                    avatar === url
+                      ? AVATAR_SELECTED_RING
+                      : 'hover:ring-1 hover:ring-muted-foreground/30',
+                  )}
+                >
+                  <img src={url} alt="" className="size-full" />
+                </button>
+              ))}
+
+              {/* Upload — uses <label htmlFor> to natively trigger the file input */}
+              <label
+                htmlFor={FILE_INPUT_ID}
+                className={cn(
+                  'flex aspect-square w-full items-center justify-center rounded-full cursor-pointer transition-all duration-150 border border-dashed',
+                  'hover:scale-110 active:scale-95',
+                  isCustomAvatar(avatar)
+                    ? cn(
+                        AVATAR_SELECTED_RING,
+                        'border-violet-300 dark:border-violet-600 bg-violet-50 dark:bg-violet-900/30',
+                      )
+                    : 'border-muted-foreground/30 text-muted-foreground/50 hover:border-muted-foreground/50',
+                )}
+                title={t('profile.uploadAvatar')}
+              >
+                <ImagePlus className="size-3.5" />
+              </label>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Bio input */}
+      <Textarea
+        value={bioDraft}
+        onChange={(e) => {
+          setBioDraft(e.target.value);
+          bioPending.current = e.target.value;
+          if (bioTimer.current) clearTimeout(bioTimer.current);
+          bioTimer.current = setTimeout(flushBio, PROFILE_BIO_SAVE_DELAY_MS);
+        }}
+        onBlur={flushBio}
+        placeholder={t('profile.bioPlaceholder')}
+        maxLength={200}
+        rows={3}
+        data-profile-bio=""
+        className="mt-3 resize-none bg-background/50 min-h-[80px]"
+      />
+    </Card>
+  );
+}

@@ -1,0 +1,2415 @@
+'use client';
+
+import { useMediaQuery } from '@/lib/hooks/use-media-query';
+import { WORKSPACE_NARROW_QUERY } from '@/lib/adaptive/media-queries';
+
+/**
+ * The Pro workspace — `/workspace`, and the only Pro surface there is.
+ *
+ * Three independent panes: navigation, the agent conversation, the classroom.
+ * Full-viewport, no global header (`AppChrome` suppresses SiteHeader on this
+ * path), which is the whole reason Pro mode became a route instead of a
+ * `useState` on the homepage.
+ *
+ * ── What is open is mirrored into the URL ────────────────────────────────
+ *
+ *   /workspace                               home (hero + composer + discover)
+ *   /workspace?session=<id>                  navigation + conversation
+ *   /workspace?course=<stageId>              navigation + classroom
+ *   /workspace?session=<id>&course=<stageId> all three
+ *
+ * The mounted workspace owns the live pane state; the two params are its
+ * deep-link/history projection. Query-only changes use the native History API
+ * rather than starting a new App Router navigation. The params are independent,
+ * and that independence is the point: an
+ * agent session and a course are MANY-TO-MANY here. A session's server-side
+ * stage never moves — the runner writes where it always wrote — but what the
+ * classroom pane shows is the user's choice, made in the tree. Opening a
+ * session therefore mounts the conversation and nothing else; the course
+ * beside it is opened, switched and closed independently, and the
+ * conversation does not so much as re-render when it changes (the panes are
+ * siblings, so a course switch cannot unmount the chat and lose its draft).
+ *
+ * A course opened with NO session is the one asymmetry: a Pro editing bench with
+ * no conversation beside it cannot be talked to at all, so `?course=` alone
+ * carries the user's most recent conversation into the middle column — or, for a
+ * user who has none, shows an empty composer whose first message creates one.
+ * The one exception is an explicit "new chat", which keeps the classroom and puts
+ * that empty composer in the middle column instead of carrying anything over.
+ * Nothing is minted on arrival, and it is never "the session that owns this
+ * course". The classroom keeps rendering (and reading) throughout. See
+ * `lib/workbench/course-chat-bootstrap.ts`.
+ *
+ * ── What the panes are made of ───────────────────────────────────────────
+ *
+ * Nothing here is a second implementation. The conversation is
+ * `WorkbenchChat` on the same session store and the same SSE attach; the
+ * classroom is `ClassroomSurface`, the exact component `/classroom/[id]`
+ * mounts, hosted through `WorkbenchPanelProvider` so it drops the chrome the
+ * pane already provides. The visual layer is `workspace-shell.css`, scoped
+ * under `.ws-root` and imported from this file so it never reaches `/`.
+ */
+
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { toast } from 'sonner';
+// The workspace's visual layer. Imported HERE rather than from `globals.css`
+// so it lands in this route's CSS chunk only — `/` must not receive it.
+import '../workspace-shell.css';
+import { useI18n } from '@/lib/hooks/use-i18n';
+import { useHomeDiscovery, type HomeDiscoveryState } from '@/lib/hooks/use-home-discovery';
+import {
+  reconcileAttachedSessionStatus,
+  type ProHomeSessionItem,
+} from '@/lib/workbench/pro-home-data';
+import { OwnerSessionClient } from '@/lib/workbench/owner-session-client';
+import { useRunningSessions } from '@/lib/workbench/running-sessions';
+import { resolveCourseChatBootstrap } from '@/lib/workbench/course-chat-bootstrap';
+import { startConversationWithFirstMessage } from '@/lib/workbench/first-message-session';
+import { createdCourseTabsToOpen } from '@/lib/workbench/created-course-tabs';
+import {
+  classroomHref,
+  isCourseReadOnly,
+  resolveCourseAccess,
+} from '@/lib/workbench/course-read-only';
+import { fetchStageMeta, type StageMetaResult } from '@/lib/classroom/stage-meta-client';
+import { useRouter } from 'next/navigation';
+import { draftCourseTitle } from '@/lib/workbench/draft-course-title';
+import { findGuideCourse, seedGuideCourse } from '@/lib/workbench/guide-course';
+import {
+  markOnboardingSeen,
+  resetOnboarding,
+  useOnboardingPending,
+} from '@/lib/workbench/onboarding';
+import { usePromptSeed } from '@/lib/workbench/prompt-seed';
+import { useAccessCodeGateOpen } from '@/components/access-code-guard';
+import { useTourViewport, WorkspaceTour, type TourEnd } from './WorkspaceTour';
+import { TOUR_STEPS, type TourView } from './tour-steps';
+import {
+  clampRailWidth,
+  parseRailWidth,
+  RAIL_COLLAPSE_THRESHOLD,
+  RAIL_WIDTH_DEFAULT,
+  RAIL_WIDTH_STORAGE_KEY,
+} from '@/lib/workbench/workspace-navigation';
+import {
+  activateCourseTab,
+  closeAllCourseTabs,
+  CHAT_COLLAPSED_STORAGE_KEY,
+  CHAT_WIDTH_DEFAULT,
+  CHAT_WIDTH_STORAGE_KEY,
+  CLASSROOM_COLLAPSED_STORAGE_KEY,
+  clampChatWidth,
+  closeCourseTab,
+  defaultNavCollapsed,
+  NAV_COLLAPSED_STORAGE_KEY,
+  NO_COURSE_TABS,
+  openCourseTab,
+  openCourseTabs,
+  parseChatWidth,
+  parseCollapsed,
+  readWorkspacePanes,
+  resolveWorkspaceRender,
+  restoreCourseTabs,
+  samePanes,
+  withCourse,
+  withView,
+  WORKSPACE_COURSES_VIEW,
+  WORKSPACE_LIBRARY_VIEW,
+  withSession,
+  type WorkspacePanes,
+} from '@/lib/workbench/workspace-panes';
+import { useWorkspacePaneNavigation } from '@/lib/workbench/use-workspace-pane-navigation';
+import { readCourseTabsMemory, writeCourseTabsMemory } from '@/lib/workbench/workspace-course-tabs';
+import {
+  forgetWorkspaceSession,
+  readLastWorkspaceSessionId,
+  rememberWorkspaceHome,
+  rememberWorkspaceSession,
+  validateRememberedWorkspaceSession,
+} from '@/lib/workbench/workspace-session-memory';
+import type { WorkbenchCourseSummary } from '@/lib/workbench/panel-context';
+import { useWorkbenchStore, type WorkbenchMaterial } from '@/lib/workbench/session-store';
+import { renameWorkbenchSession } from '@/lib/workbench/session-store';
+import { commitSessionRename, createSessionRenameQueue } from '@/lib/workbench/session-title';
+import type { ElementRef } from '@/lib/workbench/element-refs';
+import type { CourseRef } from '@/lib/workbench/course-refs';
+import { useStageFreshnessSync, useWorkbenchStream } from '@/lib/workbench/use-workbench-session';
+import { useGeneratedCourseDiscoverySync } from '@/lib/workbench/course-discovery-sync';
+import { useStageStore } from '@/lib/store/stage';
+import { useOwnerRuns } from '@/lib/generation-run-client/use-owner-runs';
+import { discardGenerationRun } from '@/lib/generation-run-client/api';
+import { pendingCourseRuns, runsByCourse } from '@/lib/generation-run-client/course-card';
+import { WorkspaceRail } from './WorkspaceRail';
+import { WorkspaceHome } from './WorkspaceHome';
+import { WorkspaceChatPane } from './WorkspaceChatPane';
+import { WorkspaceClassroomPane } from './WorkspaceClassroomPane';
+import { usePaneSteady } from './use-pane-steady';
+import {
+  NO_PREVIEW_TAB,
+  PREVIEW_TAB_ID,
+  WorkspaceRequestActivity,
+  type PreviewTabState,
+} from './WorkspaceRequestActivity';
+import { isPreviewClosed, rememberPreviewClosed } from '@/lib/workbench/preview-tab';
+import { QUEUED_REQUEST_KEY, requestEpisodeStart } from '@/lib/workbench/request-activity';
+import { requestCourse, type RequestCourse } from '@/lib/workbench/conversation-course';
+import { PaneTab } from './PaneTab';
+import { ResizeHandle } from './ResizeHandle';
+import { useResizeDragOwner } from './resize-drag-owner';
+import { MaterialLibraryPage } from './MaterialLibraryPage';
+import { WorkspaceCoursesPage } from './WorkspaceCoursesPage';
+import { WorkspaceSearchPalette } from './WorkspaceSearchPalette';
+import { SettingsDialog } from '@/components/settings';
+import { isMacPlatform, isNewChatShortcut, isSearchShortcut } from '@/lib/workbench/shortcuts';
+import type { LibraryMaterial } from '@/lib/workbench/material-library-client';
+import { hostPageItems, useWorkbenchShellExtensions } from '@/lib/workbench/shell-extensions';
+import type { MaterialSeed, MaterialSeedTarget } from '@/components/workbench/compose-extras';
+import { pendingQuestion } from '@/components/workbench/chat/question-card-state';
+import { FetchEventSource } from '@/lib/utils/fetch-event-source';
+
+const EMPTY_SESSIONS: ProHomeSessionItem[] = [];
+
+const SESSION_LIST_TIMEOUT_MS = 15_000;
+// A shell is replaceable navigation UI, not a persistence boundary. Keeping the
+// queue in this client module preserves one writer per session across remounts.
+const sessionRenameQueue = createSessionRenameQueue();
+
+async function fetchSessions(): Promise<ProHomeSessionItem[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SESSION_LIST_TIMEOUT_MS);
+  try {
+    const response = await fetch('/api/agent/sessions', {
+      credentials: 'include',
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`${response.status}`);
+    const body: unknown = await response.json();
+    if (!Array.isArray(body)) throw new Error('invalid list response');
+    return body as ProHomeSessionItem[];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function syncAttachedSessionTitle(sessionId: string, title: string | null): void {
+  const store = useWorkbenchStore.getState();
+  if (store.sessionId !== sessionId) return;
+  store.setSessionTitle(title);
+}
+
+/**
+ * Route seam: capture the deep link exactly once. Native History API writes
+ * update Next's search-param readers, while the controller below keeps its own
+ * live pane state and never treats those mirrored values as a second writer.
+ */
+export function WorkspaceShell() {
+  const searchParams = useSearchParams();
+  const [initialPanes] = useState(() => readWorkspacePanes(searchParams));
+  return <WorkspaceShellController initialPanes={initialPanes} />;
+}
+
+function WorkspaceShellController({ initialPanes }: { readonly initialPanes: WorkspacePanes }) {
+  const { t } = useI18n();
+  const navigation = useWorkspacePaneNavigation(initialPanes);
+
+  // Discover-only: course management lives in the navigation tree.
+  const courses = useHomeDiscovery({ mode: 'discover-only' });
+  /*
+   * Courses a classic generation run is still producing, live through the
+   * owner's run stream — the source the home page's cards read. Such a course
+   * is read-only until its run completes, so the rail shows its progress and
+   * does not open it, and the `@` picker does not offer it. A run that gains
+   * its course or finishes reads the course list again, so the row turns into
+   * an ordinary one (with its final page count) without a reload.
+   */
+  const { runs: ownerRuns, forget: forgetRun } = useOwnerRuns({
+    onCourseChanged: () => void courses.reload(),
+  });
+  const courseRuns = useMemo(() => runsByCourse(ownerRuns), [ownerRuns]);
+  // A run whose course is not listed yet is a row of its own, as it is a card
+  // of its own on the home page — from the moment the run starts.
+  const listedCourseIds = useMemo(
+    () => new Set(courses.classrooms.map((course) => course.id)),
+    [courses.classrooms],
+  );
+  const pendingRuns = useMemo(
+    () => pendingCourseRuns(ownerRuns, listedCourseIds),
+    [ownerRuns, listedCourseIds],
+  );
+  const generatingCourseIds = useMemo(() => new Set(courseRuns.keys()), [courseRuns]);
+  /** Discard a run whose course does not exist yet — the home card's delete. */
+  const discardPendingRun = useCallback(
+    async (runId: string) => {
+      try {
+        await discardGenerationRun(runId);
+        forgetRun(runId);
+      } catch {
+        toast.error(t('workspace.deleteFailed'));
+      }
+    },
+    [forgetRun, t],
+  );
+  const [sessions, setSessions] = useState<ProHomeSessionItem[]>(EMPTY_SESSIONS);
+  // Which conversations are running, for a classroom showing a course another
+  // conversation is still building (see `lib/workbench/running-sessions.ts`).
+  const setRunningSessions = useRunningSessions((s) => s.setFromSessions);
+  useEffect(() => {
+    setRunningSessions(sessions);
+  }, [sessions, setRunningSessions]);
+  useEffect(() => () => setRunningSessions([]), [setRunningSessions]);
+  /**
+   * The latest list, readable from queued callbacks without waiting for React
+   * to commit another render. The owner publisher updates it before setState.
+   */
+  const sessionsRef = useRef(sessions);
+  const [sessionState, setSessionState] = useState<HomeDiscoveryState>('loading');
+  const [composerReset, setComposerReset] = useState(0);
+  /**
+   * The user asked for a NEW conversation and a classroom is open beside it.
+   *
+   * Needed because dropping `?session=` is not by itself a request for a
+   * chat: a course with no conversation beside it was BROWSED, and shows with
+   * the chat column folded (`resolveCourseChatBootstrap`). Set by New chat and
+   * by the classroom's "Edit with AI"; cleared by anything that puts a
+   * conversation back in the column, by browsing to a course, and by Back /
+   * Forward (a history entry says on its own what was beside the course).
+   */
+  const [newConversationRequested, setNewConversationRequested] = useState(false);
+  /**
+   * The empty conversation was opened FOR the course beside it ("Edit with
+   * AI", the folded column's unfold, the tour's guide course): its composer
+   * starts with that course named as an `@` mention. The mention is the whole
+   * binding — sent with it, the conversation is about that course; removed,
+   * it is an ordinary new conversation. New chat names nothing.
+   */
+  const [draftNamesCourse, setDraftNamesCourse] = useState(false);
+  /**
+   * "Chat with this material" from the knowledge base: the material on its
+   * way to the one composer it names. Any navigation the teacher makes after
+   * it drops it, so it can never land in a conversation they went to instead.
+   */
+  const [materialSeed, setMaterialSeed] = useState<MaterialSeed | null>(null);
+  // Back and Forward are the teacher's navigation too. Nothing in the
+  // workspace raises `popstate` itself, so this is never the hand-over's own
+  // navigation (a push) or a background change (a replace).
+  useEffect(() => {
+    const dropMaterialSeed = () => {
+      setMaterialSeed(null);
+      setNewConversationRequested(false);
+    };
+    window.addEventListener('popstate', dropMaterialSeed);
+    return () => window.removeEventListener('popstate', dropMaterialSeed);
+  }, []);
+  /** Bumped once per hand-over, so it also numbers them. */
+  const materialSeedKeys = useRef(0);
+  const consumeMaterialSeed = useCallback((key: number) => {
+    setMaterialSeed((current) => (current?.key === key ? null : current));
+  }, []);
+  const ownerSessionClient = useRef<OwnerSessionClient | null>(null);
+  const shellGeneration = useRef(0);
+
+  const rootRef = useRef<HTMLDivElement>(null);
+  const railWidth = useRailWidth(rootRef);
+  const chatWidth = useChatWidth();
+
+  const panes = navigation.panes;
+  /**
+   * Which visit to the home surface this is. Going from home to the knowledge
+   * base page over it keeps the visit; every other move -- leaving the page,
+   * home again, a conversation, a classroom -- starts a new one. A home
+   * message answered after its composer left belongs only to the visit it
+   * was sent in (`openCreatedSessionAfterLeaving`).
+   */
+  const surface =
+    panes.sessionId !== null || panes.courseId !== null
+      ? 'elsewhere'
+      : panes.view
+        ? 'page'
+        : 'home';
+  const [homeVisit, setHomeVisit] = useState({ surface, visit: 0 });
+  if (homeVisit.surface !== surface) {
+    setHomeVisit({
+      surface,
+      visit:
+        homeVisit.surface === 'home' && surface === 'page' ? homeVisit.visit : homeVisit.visit + 1,
+    });
+  }
+  // What a late answer is checked against. -1 once the shell is gone: an
+  // answer arriving after the teacher left the workspace navigates nothing.
+  const currentHomeVisit = useRef(homeVisit.visit);
+  useLayoutEffect(() => {
+    currentHomeVisit.current = homeVisit.visit;
+  }, [homeVisit.visit]);
+  useEffect(
+    () => () => {
+      currentHomeVisit.current = -1;
+    },
+    [],
+  );
+  /**
+   * A pane change the teacher did not make just now: an agent-created course,
+   * a conversation that finished being created, a deletion the server
+   * confirmed, a bootstrap. It is decided from the panes as they are when it
+   * runs, keeps the knowledge base page if the teacher has it open, and then
+   * REPLACES the history entry rather than adding one -- otherwise Back from
+   * the page would first step through background changes made under it.
+   * Back restores the prior view and may close tabs created under the page;
+   * the saved courses remain in the library and can be reopened by URL.
+   */
+  const navigateInBackground = useCallback(
+    (change: (current: WorkspacePanes) => WorkspacePanes | null, mode: 'push' | 'replace') => {
+      navigation.update((current) => {
+        const next = change(current);
+        if (!next) return null;
+        return { next, mode: current.view ? 'replace' : mode };
+      });
+    },
+    [navigation],
+  );
+  const [rememberedResumeSessionId] = useState(() => {
+    const remembered = readLastWorkspaceSessionId();
+    return initialPanes.courseId === null && initialPanes.sessionId === remembered
+      ? remembered
+      : null;
+  });
+  useEffect(() => {
+    if (panes.sessionId) {
+      rememberWorkspaceSession(panes.sessionId);
+    } else if (!panes.courseId) {
+      rememberWorkspaceHome();
+    }
+  }, [panes.courseId, panes.sessionId]);
+  const [navDefault] = useState(() => defaultNavCollapsed(initialPanes));
+  const collapse = usePaneCollapse(navDefault);
+  const [courseTabs, setCourseTabs] = useState(() => restoreCourseTabs(null, panes.courseId));
+  /**
+   * The tab set as last committed, for work that finishes after later
+   * renders: a course deletion confirmed while the teacher opened other tabs
+   * must close only its own tab, from the set as it is then.
+   */
+  const courseTabsRef = useRef(courseTabs);
+  useLayoutEffect(() => {
+    courseTabsRef.current = courseTabs;
+  }, [courseTabs]);
+  const narrow = useMediaQuery(WORKSPACE_NARROW_QUERY);
+  // Which of the two content panes has the column, on a window too narrow for
+  // both. Not persisted: it is a consequence of the window, not a preference.
+  const [narrowFocus, setNarrowFocus] = useState<'chat' | 'classroom'>('classroom');
+
+  const playbackOn = useWorkbenchStore((s) => s.playbackOn);
+  // Read here rather than beside the other session wires below: what the store is
+  // attached to decides whether the middle column has a conversation at all, and
+  // therefore feeds the layout.
+  const attachedSessionId = useWorkbenchStore((s) => s.sessionId);
+
+  /* ── What sits beside an open course ─────────────────────────────────
+     A course opened FROM a conversation keeps that conversation in the URL
+     beside it. A course opened by BROWSING (My courses, the search palette, a
+     pasted or reloaded `?course=` link) has none: it fills the right side, the
+     chat column folded as a view state of this open (the remembered fold is
+     not written), and the classroom header offers "Edit with AI" — an empty
+     conversation about this course, created by its first message. Nothing is
+     minted on arrival and nothing unrelated is carried over.
+     See `lib/workbench/course-chat-bootstrap.ts`.
+
+     The classroom keeps rendering throughout. Its own load and the manifest
+     freshness stream are independent of which conversation sits beside it. */
+  const courseChatBootstrap = useMemo(
+    () =>
+      resolveCourseChatBootstrap({
+        courseId: panes.courseId,
+        sessionId: panes.sessionId,
+        newConversationRequested,
+      }),
+    [newConversationRequested, panes.courseId, panes.sessionId],
+  );
+  /** The course was browsed: shown alone, the chat column folded. */
+  const browsingCourse = courseChatBootstrap.kind === 'browse';
+  /** The course an empty, not-yet-created conversation is sitting beside. */
+  const draftCourseId = courseChatBootstrap.kind === 'draft' ? courseChatBootstrap.courseId : null;
+
+  const render = useMemo(
+    () =>
+      resolveWorkspaceRender({
+        panes,
+        collapse: collapse.value,
+        playback: playbackOn,
+        draftConversation: draftCourseId !== null,
+      }),
+    [panes, collapse.value, draftCourseId, playbackOn],
+  );
+
+  /**
+   * The viewport override, applied on top of the resolved render so the pure
+   * rules stay free of measurement.
+   *
+   * Below 1024px the conversation and the classroom are mutually
+   * EXCLUSIVE — but exclusive is not "one of them is gone": whichever is not
+   * showing leaves its tab, and clicking a tab moves the focus to it. (An
+   * earlier cut simply forced the chat closed at this width, which made its
+   * reopen tab a button that did nothing.)
+   */
+  const exclusive = narrow && render.chat && render.classroom;
+  const chatOpen = exclusive ? narrowFocus === 'chat' : render.chat;
+  const classroomOpen = exclusive ? narrowFocus === 'classroom' : render.classroom;
+  // A browsed course has no conversation to fold, but the column's way back is
+  // offered all the same: it opens an empty conversation about this course.
+  const chatTab =
+    render.chatTab ||
+    (exclusive && narrowFocus !== 'chat') ||
+    (browsingCourse && render.classroom && !playbackOn);
+  const classroomTab = render.classroomTab || (exclusive && narrowFocus !== 'classroom');
+  /**
+   * Who may fold, and what the seam is for.
+   *
+   * Each pane folds from ITS OWN header (`PaneFoldButton`), never from the seam:
+   * a seam sits between two collapsible panes, so a fold on it can only speak
+   * for one of them, and putting both there produced two reversed chevrons at one
+   * height beside a third (the slide navigator's). The seam is now purely the
+   * resize control, and it exists only while both panes are on screen — a folded
+   * pane has no width to drag.
+   */
+  const bothPanesOnScreen = chatOpen && classroomOpen;
+
+  const focusClassroom = () => {
+    setNarrowFocus('classroom');
+    collapse.expandClassroom();
+  };
+
+  /**
+   * MOUNTED is not VISIBLE. A collapsed pane is hidden, never unmounted: the
+   * conversation would lose its composer draft and its scroll position, and
+   * the classroom would run its whole load again (clearing the media store and
+   * the whiteboard history on the way) for a course that never changed. The
+   * tab beside it is the affordance; `display: none` is the mechanism.
+   */
+  const chatMounted = panes.sessionId !== null || draftCourseId !== null;
+
+  // The right pane has two lifecycle states: content, or no pane. When it is
+  // closed (or no course has ever been opened for this conversation), chat
+  // owns the main column; there is no synthetic empty right-hand surface.
+  const chatFills = !classroomOpen;
+
+  const loadSessions = useCallback((showLoading = false) => {
+    ownerSessionClient.current?.requestFullFetch(showLoading);
+  }, []);
+
+  const publishOwnerSessions = useCallback(
+    (next: readonly ProHomeSessionItem[], source?: 'incremental' | 'snapshot') => {
+      const snapshot = [...next];
+      sessionsRef.current = snapshot;
+      setSessions(snapshot);
+      // Sparse owner events carry only their own field. A status publication
+      // therefore has no authority over the title it happens to copy from the
+      // client's current row; only a complete list snapshot may repair the
+      // attached header here. Local renames and title events use their explicit
+      // paths below.
+      if (source !== 'snapshot') return;
+      const attachedId = useWorkbenchStore.getState().sessionId;
+      const attached = snapshot.find((session) => session.id === attachedId);
+      if (attached) syncAttachedSessionTitle(attached.id, attached.title ?? null);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const client = new OwnerSessionClient({
+      fetchSessions,
+      createEventSource: (url) => new FetchEventSource(url),
+      onSessions: publishOwnerSessions,
+      onSessionTitle: syncAttachedSessionTitle,
+      onState: setSessionState,
+    });
+    ownerSessionClient.current = client;
+    client.start();
+    return () => {
+      shellGeneration.current += 1;
+      ownerSessionClient.current = null;
+      client.stop();
+    };
+  }, [publishOwnerSessions]);
+
+  useEffect(() => {
+    if (
+      sessionState !== 'ready' ||
+      !rememberedResumeSessionId ||
+      panes.sessionId !== rememberedResumeSessionId
+    ) {
+      return;
+    }
+    if (
+      validateRememberedWorkspaceSession(
+        rememberedResumeSessionId,
+        sessions.map((session) => session.id),
+      )
+    ) {
+      return;
+    }
+    navigateInBackground((current) => ({ ...current, sessionId: null, courseId: null }), 'replace');
+  }, [navigateInBackground, panes.sessionId, rememberedResumeSessionId, sessions, sessionState]);
+
+  // ── Navigation ────────────────────────────────────────────────────────
+  /** The teacher's own navigation, from the panes this render shows. */
+  const goTo = useCallback(
+    (next: WorkspacePanes) => {
+      if (samePanes(next, panes)) return;
+      navigation.push(next);
+    },
+    [navigation, panes],
+  );
+
+  /**
+   * Which visit to an empty conversation this is. Any other conversation or
+   * classroom in the column, or a new chat asked for (a hand-over is one),
+   * starts a new visit; the knowledge base page over it does not. A draft's
+   * first message answered after its visit ended belongs to the visit it was
+   * sent in (see `draftConversation`): the conversation it created stays in
+   * the rail, and the column stays where the teacher took it.
+   */
+  const draftVisit = useRef(0);
+  useLayoutEffect(() => {
+    draftVisit.current += 1;
+  }, [panes.sessionId, panes.courseId]);
+
+  const persistCourseTabs = useCallback((next: typeof courseTabs) => {
+    writeCourseTabsMemory(next);
+  }, []);
+
+  /**
+   * Reconcile the arrival URL's active course with local browser memory.
+   * A pasted `?course=` always wins as active and joins the remembered set.
+   * No `?course=` means the classroom is CLOSED, including on first arrival:
+   * a remembered tab must never turn a session-only entry back into both panes.
+   * After arrival, a missing course is an explicit close/home/history snapshot
+   * and must never be overwritten by storage.
+   * Session changes are irrelevant: every chat sees the same right-hand tab set.
+   * The global minimise flag is intentionally untouched, so a remembered set
+   * restores behind its reopen tab when that flag is set.
+   */
+  const courseTabsHydrated = useRef(false);
+  useLayoutEffect(() => {
+    // Storage restoration is an arrival concern, not a standing instruction.
+    // Once mounted, a URL with no course means "the classroom is closed" — in
+    // particular after Logo/home and browser Back. Re-reading storage on every
+    // param change used to reopen the course and start a URL write-back loop.
+    if (courseTabsHydrated.current) {
+      const reconciled = panes.courseId
+        ? restoreCourseTabs(courseTabs, panes.courseId)
+        : courseTabs.activeCourseId === null
+          ? courseTabs
+          : closeAllCourseTabs(courseTabs);
+      if (reconciled !== courseTabs) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- browser history is an external system being reconciled into the local tab model
+        setCourseTabs(reconciled);
+        writeCourseTabsMemory(reconciled);
+      }
+      return;
+    }
+
+    // Pane presence comes from the URL, not storage. In particular the classic
+    // homepage enters Pro with `?session=<last-opened>`; restoring an unrelated
+    // remembered classroom here would immediately violate that explicit intent.
+    if (!panes.courseId) {
+      courseTabsHydrated.current = true;
+      return;
+    }
+
+    // An explicit URL course opens even when it is absent from the rail; memory
+    // only contributes the rest of the tab set around that explicit active id.
+    const restored = restoreCourseTabs(readCourseTabsMemory(), panes.courseId);
+    courseTabsHydrated.current = true;
+    setCourseTabs(restored);
+    writeCourseTabsMemory(restored);
+    if (restored.activeCourseId !== panes.courseId) {
+      navigation.replace(withCourse(panes, restored.activeCourseId));
+    }
+  }, [courseTabs, navigation, panes]);
+
+  /**
+   * Step the request preview back behind the course tabs. Bound below, where
+   * the preview's focus state lives; an explicit open of a course (My courses,
+   * a course link in the chat, the tour) must show that course even while a
+   * preview is the active tab. The preview stays in the strip, mounted, so an
+   * ask waiting in it is still there when its tab is chosen again.
+   */
+  const unfocusPreview = useRef<() => void>(() => {});
+  const openCourse = useCallback(
+    (courseId: string) => {
+      unfocusPreview.current();
+      const next = openCourseTab(courseTabs, courseId);
+      setCourseTabs(next);
+      persistCourseTabs(next);
+      collapse.expandClassroom();
+      setMaterialSeed(null);
+      goTo(withView(withCourse(panes, next.activeCourseId), null));
+    },
+    [collapse, courseTabs, goTo, panes, persistCourseTabs],
+  );
+
+  /**
+   * Open a course by BROWSING — My courses, the search palette — rather than
+   * from a conversation: the conversation in the middle column is left (it
+   * stays in the rail), and the course shows alone, the chat column folded
+   * (`resolveCourseChatBootstrap`'s `browse`). `startConversation` instead
+   * puts an empty conversation about the course beside it (the tour's guide
+   * course, whose next steps show that conversation).
+   */
+  const browseCourse = useCallback(
+    (courseId: string, startConversation = false) => {
+      unfocusPreview.current();
+      const next = openCourseTab(courseTabs, courseId);
+      setCourseTabs(next);
+      persistCourseTabs(next);
+      collapse.expandClassroom();
+      setMaterialSeed(null);
+      setNewConversationRequested(startConversation);
+      setDraftNamesCourse(startConversation);
+      if (startConversation) {
+        draftVisit.current += 1;
+        collapse.expandChat();
+      }
+      goTo(withView(withCourse(withSession(panes, null), next.activeCourseId), null));
+    },
+    [collapse, courseTabs, goTo, panes, persistCourseTabs],
+  );
+
+  /**
+   * Reconcile a BATCH of agent-created courses into the tab strip.
+   *
+   * An existing active classroom is explicit user intent and keeps focus; the
+   * new courses join in the background. Only an empty classroom pane activates
+   * the newest arrival. Historical `stage_link` replay used to steal focus from
+   * a pasted/selected course and rewrite `?course=` a second time.
+   */
+  const openCourses = useCallback(
+    (courseIds: readonly string[]) => {
+      const opened = openCourseTabs(courseTabs, courseIds);
+      const next = courseTabs.activeCourseId
+        ? activateCourseTab(opened, courseTabs.activeCourseId)
+        : opened;
+      if (next === courseTabs) return;
+      setCourseTabs(next);
+      persistCourseTabs(next);
+      if (!courseTabs.activeCourseId) {
+        collapse.expandClassroom();
+        navigateInBackground((current) => withCourse(current, next.activeCourseId), 'push');
+      }
+    },
+    [collapse, courseTabs, navigateInBackground, persistCourseTabs],
+  );
+
+  const openSession = useCallback(
+    (sessionId: string) => {
+      setNewConversationRequested(false);
+      collapse.expandChat();
+      setMaterialSeed(null);
+      goTo(withView(withSession(panes, sessionId), null));
+    },
+    [collapse, goTo, panes],
+  );
+
+  /**
+   * The conversation the home composer just started on this page, and whether
+   * the rail has had its one fold for its first request's preview. Only that
+   * preview — the "focus on what is being built" moment — folds the rail;
+   * every other preview (a follow-up in an existing conversation, one
+   * restored with its conversation, switching back to a preview tab) leaves
+   * the rail as the teacher had it.
+   */
+  const [homeRequest, setHomeRequest] = useState<{
+    readonly sessionId: string | null;
+    readonly requestKey: string | null;
+    readonly used: boolean;
+  }>({ sessionId: null, requestKey: null, used: true });
+
+  /** The home composer's conversation exists now, the composer still on screen. */
+  const openCreatedSession = useCallback(
+    (sessionId: string) => {
+      setHomeRequest({ sessionId, requestKey: null, used: false });
+      // Opening the pane is immediate, but the rail still needs a pull fallback
+      // when the owner EventSource is reconnecting or missed session_created.
+      loadSessions();
+      setNewConversationRequested(false);
+      collapse.expandChat();
+      navigateInBackground((current) => withSession(current, sessionId), 'push');
+    },
+    [collapse, loadSessions, navigateInBackground],
+  );
+
+  /**
+   * The home composer's conversation exists now, but its composer left the
+   * tree while the POST was in flight. Leaving home for the knowledge base
+   * page is not leaving the conversation: it attaches under the page, which
+   * stays (replace, so one Back still leaves it) -- if the teacher is still
+   * on the page they opened from that home. Anything else, even the same
+   * page reached again after leaving it, was the teacher moving on; the
+   * conversation stays in the rail, as before. The composer calls the
+   * callback of the render it sent from, which carries that visit.
+   */
+  const sentInHomeVisit = homeVisit.visit;
+  const openCreatedSessionAfterLeaving = useCallback(
+    (sessionId: string) => {
+      loadSessions();
+      if (currentHomeVisit.current !== sentInHomeVisit) return;
+      let attached = false;
+      navigateInBackground((current) => {
+        if (!current.view || current.sessionId !== null || current.courseId !== null) {
+          return null;
+        }
+        attached = true;
+        return withSession(current, sessionId);
+      }, 'replace');
+      if (!attached) return;
+      setNewConversationRequested(false);
+      collapse.expandChat();
+    },
+    [collapse, loadSessions, navigateInBackground, sentInHomeVisit],
+  );
+
+  const activateCourse = useCallback(
+    (courseId: string) => {
+      const next = activateCourseTab(courseTabs, courseId);
+      if (next === courseTabs) return;
+      setMaterialSeed(null);
+      setCourseTabs(next);
+      persistCourseTabs(next);
+      goTo(withCourse(panes, next.activeCourseId));
+    },
+    [courseTabs, goTo, panes, persistCourseTabs],
+  );
+
+  const closeCourse = useCallback(
+    (courseId: string) => {
+      const current = courseTabsRef.current;
+      const next = closeCourseTab(current, courseId);
+      if (next === current) return;
+      courseTabsRef.current = next;
+      setCourseTabs(next);
+      persistCourseTabs(next);
+      // Also the end of a course deletion (`handleCourseDeleted`), which the
+      // teacher may have left the classroom for while it was confirmed.
+      navigateInBackground((panesNow) => withCourse(panesNow, next.activeCourseId), 'push');
+    },
+    [navigateInBackground, persistCourseTabs],
+  );
+
+  /**
+   * The attached chat was deleted from the rail. The URL is the only thing
+   * still holding it open, so it has to move: the session param is dropped —
+   * the course pane, its tabs, and its browser memory are independent and stay.
+   * The rail's own row is already gone optimistically; this runs only after the
+   * server confirmed the delete, so a failed delete never navigates (the row
+   * comes back and the toast explains why).
+   */
+  const handleSessionDeleted = useCallback(
+    (sessionId: string) => {
+      forgetWorkspaceSession(sessionId);
+      let attached = false;
+      navigateInBackground((current) => {
+        if (current.sessionId !== sessionId) return null;
+        attached = true;
+        return withSession(current, null);
+      }, 'push');
+      if (attached) setNewConversationRequested(false);
+    },
+    [navigateInBackground],
+  );
+
+  /** A rail destination (the knowledge base, my courses, a host page) takes the main area. */
+  const openView = useCallback(
+    (view: string) => {
+      setMaterialSeed(null);
+      goTo(withView(panes, view));
+    },
+    [goTo, panes],
+  );
+
+  // ── Global search (⌘K / Ctrl K, or the rail's Search) ───────────────
+  const [searchOpen, setSearchOpen] = useState(false);
+  /**
+   * The model/provider settings dialog — the same component the classic home
+   * opens from its header pill. The shell owns it: the account menu and the
+   * search's Settings action both open it.
+   */
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    const mac = isMacPlatform();
+    const onKeyDown = (event: KeyboardEvent) => {
+      // An editor inside the page that binds the chord itself keeps it.
+      if (event.defaultPrevented || !isSearchShortcut(event, mac)) return;
+      event.preventDefault();
+      setSearchOpen((open) => !open);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+  /**
+   * A material picked in the search: the knowledge base opens on it. The key
+   * makes picking the same file twice locate it twice.
+   */
+  const [locatedMaterial, setLocatedMaterial] = useState<{
+    readonly key: number;
+    readonly materialId: string;
+    readonly name: string;
+  } | null>(null);
+  const openMaterial = useCallback(
+    (material: LibraryMaterial) => {
+      setLocatedMaterial((current) => ({
+        key: (current?.key ?? 0) + 1,
+        materialId: material.materialId,
+        name: material.name,
+      }));
+      openView(WORKSPACE_LIBRARY_VIEW);
+    },
+    [openView],
+  );
+
+  /**
+   * The page's own way back (its compact header, where the rail is hidden):
+   * the panes it covers come back as they were. A navigation that drops the
+   * view, not a history step, so a page opened from a pasted link leaves too.
+   */
+  const leaveView = useCallback(() => {
+    setMaterialSeed(null);
+    goTo(withView(panes, null));
+  }, [goTo, panes]);
+
+  /*
+   * The pages a host registered (`WorkbenchShellExtensions.navItems` with a
+   * `render`). A `?view=` naming no page this deployment has -- a stale link,
+   * a host page since removed -- is dropped rather than leaving an empty main
+   * area.
+   */
+  const shellExtensions = useWorkbenchShellExtensions();
+  const hostPages = useMemo(() => hostPageItems(shellExtensions), [shellExtensions]);
+  /*
+   * The guide course: seeded into the owner's library the first time it loads
+   * (once per owner; see `lib/workbench/guide-course.ts`), then an ordinary
+   * course of theirs, which the first-run tour walks through.
+   */
+  const guideOption = shellExtensions.guideCourse;
+  const coursesReady = courses.state === 'ready';
+  const reloadCourses = courses.reload;
+  const courseList = courses.classrooms;
+  // Whether the seed has had its say: until then the tour does not know if its
+  // guide-course steps belong, and starting it early showed a shorter tour that
+  // grew once a first visit's seed landed. Kept per owner: a sign-in or
+  // sign-out (`auth-change`, which also reloads the list) starts a new owner
+  // generation, and a seed still settling for the previous owner does not
+  // count for the new one.
+  const ownerGeneration = useRef(0);
+  const [currentGeneration, setCurrentGeneration] = useState(0);
+  const [seededGeneration, setSeededGeneration] = useState(-1);
+  useEffect(() => {
+    const next = () => {
+      ownerGeneration.current += 1;
+      setCurrentGeneration(ownerGeneration.current);
+    };
+    window.addEventListener('auth-change', next);
+    return () => window.removeEventListener('auth-change', next);
+  }, []);
+  useEffect(() => {
+    if (!coursesReady) return;
+    const generation = ownerGeneration.current;
+    void seedGuideCourse(guideOption, courseList)
+      .then(async (outcome) => {
+        // `present`: a claim brought a guide course in after this list loaded.
+        if (outcome === 'created' || outcome === 'present') await reloadCourses();
+      })
+      .catch(() => undefined)
+      .finally(() => setSeededGeneration(generation));
+    // Settled owners return at once (browser memory), so a list that changes
+    // later costs nothing.
+  }, [coursesReady, guideOption, courseList, reloadCourses]);
+  const guideSeedDone = seededGeneration === currentGeneration;
+  const guideCourseId = guideOption === false ? null : findGuideCourse(courses.classrooms);
+  const guideSettled = guideOption === false || !!guideCourseId || guideSeedDone;
+  const unknownView =
+    !!panes.view &&
+    panes.view !== WORKSPACE_LIBRARY_VIEW &&
+    panes.view !== WORKSPACE_COURSES_VIEW &&
+    !hostPages.has(panes.view);
+  useEffect(() => {
+    if (unknownView) navigation.replace(withView(panes, null));
+  }, [navigation, panes, unknownView]);
+
+  /**
+   * The title a chat is displaying right now, wherever it is displayed: the
+   * rail row and — when this is the attached conversation — the pane header,
+   * which reads its own copy out of the session store.
+   */
+  const applySessionTitle = useCallback(
+    (sessionId: string, title: string | null, settled: boolean) => {
+      syncAttachedSessionTitle(sessionId, title);
+      const client = ownerSessionClient.current;
+      const revision = client?.updateSessionTitle(sessionId, title, settled) ?? null;
+      return { client, revision };
+    },
+    [],
+  );
+
+  /**
+   * Rename a conversation. ONE writer for both surfaces that offer it — the
+   * rail row's menu and the pane header — because two would be two chances for
+   * the header and the list to end up showing different names for the same
+   * chat. The sequence itself (optimistic write, settle on what the server
+   * stored, roll back on refusal) lives in `commitSessionRename`.
+   *
+   * An empty box clears the override rather than storing a blank name: the
+   * title goes back to being derived from the first message. Returns a message
+   * on failure, null otherwise — the same contract the rail's course and folder
+   * renames use.
+   */
+  const renameSession = useCallback(
+    (sessionId: string, raw: string): Promise<string | null> => {
+      const generation = shellGeneration.current;
+      const isOriginCurrent = () => shellGeneration.current === generation;
+      return sessionRenameQueue.run(sessionId, async (queued) => {
+        const row = sessionsRef.current.find((session) => session.id === sessionId);
+        const store = useWorkbenchStore.getState();
+        const attached = store.sessionId === sessionId;
+        let decision: ReturnType<typeof applySessionTitle> | null = null;
+        const outcome = await commitSessionRename({
+          current: {
+            title: row?.title ?? (attached ? store.sessionTitle : null),
+            prompt: row?.prompt ?? (attached ? store.sessionPrompt : null),
+          },
+          raw,
+          apply: (title, settled) => {
+            if (!isOriginCurrent()) return;
+            decision = applySessionTitle(sessionId, title, settled);
+          },
+          save: (title) => renameWorkbenchSession(sessionId, title),
+          isCurrent: () => {
+            if (!isOriginCurrent() || !decision?.client || decision.revision === null) {
+              return false;
+            }
+            return (
+              ownerSessionClient.current === decision.client &&
+              decision.client.isSessionTitleRevisionCurrent(sessionId, decision.revision)
+            );
+          },
+          // A queued value that looks unchanged may be the user's explicit
+          // attempt to undo the still-ambiguous write ahead of it.
+          forceSave: queued,
+        });
+        // A failed write is still ambiguous at the transport boundary: the
+        // database may have committed before the response was lost, and an
+        // optimistic mutation may have hidden a newer snapshot while it was in
+        // flight. Reconcile every attempted change; unchanged input did no IO.
+        if (isOriginCurrent() && outcome !== 'unchanged') {
+          ownerSessionClient.current?.requestFullFetch();
+        }
+        if (outcome !== 'failed') return null;
+        const message = t('workspace.renameSessionFailed');
+        if (isOriginCurrent()) toast.error(message);
+        return message;
+      });
+    },
+    [applySessionTitle, t],
+  );
+
+  /**
+   * A course was deleted from My courses. `deleteCourse` already removed the
+   * row optimistically and rolls the list back (plus toast) on failure; the
+   * shell's part is the classroom pane: on success the course's tab closes,
+   * handing the pane to its neighbour, or shutting the pane entirely when it
+   * was the last tab. A background tab just disappears; a course that was not
+   * open at all never touches the pane.
+   */
+  const handleCourseDeleted = useCallback(
+    async (courseId: string) => {
+      const deleted = await courses.deleteCourse(courseId);
+      if (deleted) closeCourse(courseId);
+    },
+    [closeCourse, courses],
+  );
+
+  /**
+   * Back to the bare workspace: both panes dropped, the composer refocused.
+   *
+   * The LOGO, and only the logo. It used to be the rail's "new chat" button as
+   * well, which made starting a conversation close whatever classroom was open —
+   * the two columns are independent, and a new chat is not a reason to put the
+   * course away. That is `startNewConversation` below.
+   */
+  /** The tour's example prompt on its way to the home composer, taken once. */
+  const promptSeeds = usePromptSeed();
+  const goHome = () => {
+    promptSeeds.clear();
+    if (panes.sessionId || panes.courseId || panes.view) {
+      navigation.push({ sessionId: null, courseId: null });
+    }
+    setCourseTabs(NO_COURSE_TABS);
+    persistCourseTabs(NO_COURSE_TABS);
+    setNewConversationRequested(false);
+    setMaterialSeed(null);
+    setComposerReset((value) => value + 1);
+  };
+
+  /* ── First-run tour ────────────────────────────────────────────────────
+     Plays once, on the first desktop visit to home (and again from the
+     account menu's "Getting started"). Once started it stays up while it
+     walks the workspace through My courses and the built-in course. */
+  const tourPending = useOnboardingPending('home');
+  // The rail it walks through is there from `md` up; a phone gets no tour.
+  const tourFits = useTourViewport();
+  // Not under the access-code gate: the tour is a modal of its own, and one
+  // started behind the gate's dialog took the focus its input needs. Accepting
+  // the code mounts the workspace again, and the tour starts then.
+  const accessGateOpen = useAccessCodeGateOpen();
+  const [tourRunning, setTourRunning] = useState(false);
+  const showTour =
+    accessGateOpen && tourPending && (tourRunning || (render.home && tourFits && guideSettled));
+  const currentTourSteps = useMemo(
+    () => TOUR_STEPS.filter((step) => !step.needsGuide || !!guideCourseId),
+    [guideCourseId],
+  );
+  // Fixed while the tour is up: a guide course arriving mid-tour (a later
+  // retry of a failed seed) must not renumber the steps under the reader.
+  const [startedTourSteps, setStartedTourSteps] = useState<typeof currentTourSteps | null>(null);
+  if (showTour && !startedTourSteps) setStartedTourSteps(currentTourSteps);
+  if (!showTour && startedTourSteps) setStartedTourSteps(null);
+  const tourSteps = startedTourSteps ?? currentTourSteps;
+  const tourNavigate = (view: TourView) => {
+    if (view === 'courses') {
+      if (render.view !== WORKSPACE_COURSES_VIEW) openView(WORKSPACE_COURSES_VIEW);
+    } else if (view === 'classroom') {
+      if (guideCourseId && (panes.courseId !== guideCourseId || render.view))
+        browseCourse(guideCourseId, true);
+    } else if (!render.home) {
+      leaveTourCourse();
+    }
+  };
+  /** Back to an empty home: the course the tour opened is closed again. */
+  const leaveTourCourse = () => goHome();
+  const endTour = (how: TourEnd) => {
+    setTourRunning(false);
+    markOnboardingSeen('home');
+    if (how === 'guide' && guideCourseId) {
+      browseCourse(guideCourseId, true);
+      return;
+    }
+    if (!render.home) leaveTourCourse();
+  };
+  const sendTourExample = (prompt: string) => promptSeeds.send(prompt);
+
+  /**
+   * A new conversation in the middle column. THE CLASSROOM PANE IS LEFT ALONE.
+   *
+   * Only `?session=` is dropped — `?course=` and this chat's tab set stay, so the
+   * classroom keeps its `ClassroomSurface` mounted at the page it was on. That is
+   * not cosmetic: remounting it would run the whole classroom load again and clear
+   * the media store and the whiteboard history for a course that never changed.
+   *
+   * Nothing is created here. `newConversationRequested` sends the middle column to
+   * its empty-composer state (lazy creation) and the session is minted by the
+   * first message. With no classroom open this is the home surface, which is where
+   * the empty composer already lives.
+   */
+  const startNewConversation = () => {
+    draftVisit.current += 1;
+    setNewConversationRequested(true);
+    setDraftNamesCourse(false);
+    collapse.expandChat();
+    setMaterialSeed(null);
+    // The teacher's own choice, so it also leaves the knowledge base page.
+    if (panes.courseId) {
+      if (panes.sessionId || panes.view) {
+        navigation.push({ sessionId: null, courseId: panes.courseId });
+      }
+    } else {
+      if (panes.sessionId || panes.view) navigation.push({ sessionId: null, courseId: null });
+      setCourseTabs(NO_COURSE_TABS);
+      persistCourseTabs(NO_COURSE_TABS);
+    }
+    setComposerReset((value) => value + 1);
+  };
+
+  const focusChat = () => {
+    // The strip is the folded conversation's ONE way back, and it must work
+    // whichever reason folded it: a narrow window's exclusivity, the user's
+    // own fold on the seam, or a browsed course (which has no conversation
+    // yet: the strip starts one about it, as "Edit with AI" does).
+    if (browsingCourse) {
+      // A course the viewer cannot change gets no conversation about it: the
+      // strip opens an ordinary new one, naming nothing.
+      if (readOnlyCourse) {
+        startNewConversation();
+        setNarrowFocus('chat');
+      } else {
+        talkAboutCourse();
+      }
+      return;
+    }
+    collapse.expandChat();
+    setNarrowFocus('chat');
+  };
+  /**
+   * "Edit with AI" on a browsed course: an empty conversation beside it,
+   * created by its first message (started beside an existing course, so no
+   * new-course preview). The conversation that was open before stays in the
+   * rail.
+   */
+  const talkAboutCourse = () => {
+    startNewConversation();
+    setDraftNamesCourse(true);
+    setNarrowFocus('chat');
+  };
+  // Stable for the memoised classroom pane; always runs the latest render's.
+  const talkAboutCourseRef = useRef(talkAboutCourse);
+  useLayoutEffect(() => {
+    talkAboutCourseRef.current = talkAboutCourse;
+  });
+  const [talkAboutCourseStable] = useState(() => () => talkAboutCourseRef.current());
+
+  // ⌘J / Ctrl+J: a new chat from anywhere, exactly as the rail's button.
+  const startNewConversationRef = useRef(startNewConversation);
+  useEffect(() => {
+    startNewConversationRef.current = startNewConversation;
+  });
+  useEffect(() => {
+    const mac = isMacPlatform();
+    const onKeyDown = (event: KeyboardEvent) => {
+      // An editor inside the page that binds the chord itself keeps it.
+      if (event.defaultPrevented || !isNewChatShortcut(event, mac)) return;
+      event.preventDefault();
+      setSearchOpen(false);
+      startNewConversationRef.current();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  /**
+   * The knowledge base page's "chat with this material": a new conversation
+   * -- beside the open classroom, or on the home composer -- with the
+   * material staged in it (RFC #1716 §7). The target is decided now, from the
+   * panes the teacher is looking at; the hand-over is set only AFTER
+   * `startNewConversation`, which drops any earlier one.
+   */
+  const chatWithMaterial = (material: WorkbenchMaterial) => {
+    const target: MaterialSeedTarget = panes.courseId
+      ? { kind: 'chat', ownerKey: `draft:${panes.courseId}` }
+      : { kind: 'home' };
+    startNewConversation();
+    materialSeedKeys.current += 1;
+    setMaterialSeed({ key: materialSeedKeys.current, material, target });
+  };
+
+  // ── The session wires ─────────────────────────────────────────────────
+  //
+  // Both live here rather than inside a pane: the SSE attach must survive the
+  // classroom pane opening, closing and switching courses, and a wire that
+  // unmounts with a pane would replay the whole event log every time.
+  const attach = useWorkbenchStore((s) => s.attach);
+  const detach = useWorkbenchStore((s) => s.detach);
+  const attachedSessionStatus = useWorkbenchStore((s) => s.status);
+  const attachedSessionConnected = useWorkbenchStore((s) => s.attached);
+  const attachedSessionPendingWork = useWorkbenchStore(
+    (s) => s.generationOpen || s.waitingKey !== null || s.waitingArmed,
+  );
+  // The open question card the chat shows, as the rail's "waiting for your
+  // answer" mark. Undefined while the backlog replays: a half-replayed log can
+  // hold a question whose answer has not been folded in yet.
+  const attachedSessionAwaitingAnswer = useWorkbenchStore((s) =>
+    s.replaying ? undefined : pendingQuestion(s.chat) !== null,
+  );
+  const sessionStageId = useWorkbenchStore((s) => s.stageId);
+  // How many stage/folder writes this run has made — the trigger that puts an
+  // agent-created course or folder in the left rail without a page reload.
+  const libraryRevision = useWorkbenchStore((s) => s.libraryRevision);
+  // Course links in first-seen order — each stage opens at most once per session.
+  const stageLinkStageIds = useWorkbenchStore((s) => s.stageLinkStageIds);
+  const attachedSessionReplaying = useWorkbenchStore((s) => s.replaying);
+  const replayedStageLinkCount = useWorkbenchStore((s) => s.replayedStageLinkCount);
+  // Serialize only provenance ids: streaming text changes must not restart the
+  // scene reads. This is a derived value, not another lifecycle/store.
+  // The courses this request created, in creation order, serialized so
+  // streaming text does not change the selector's value.
+  const requestCreatedCourseIds = useWorkbenchStore((s) =>
+    JSON.stringify(
+      s.chat.slice(requestEpisodeStart(s.chat) + 1).flatMap((node) => {
+        if (node.kind !== 'tool' || node.toolName !== 'create_stage' || node.toolState !== 'done')
+          return [];
+        // `reused` is a retry of this same call (the id derives from the call
+        // id), so it still proves this request created the course.
+        const details = node.toolDetails as { stageId?: unknown } | undefined;
+        return typeof details?.stageId === 'string' ? [details.stageId] : [];
+      }),
+    ),
+  );
+  const createdThisRequest = useMemo(
+    () => JSON.parse(requestCreatedCourseIds) as string[],
+    [requestCreatedCourseIds],
+  );
+  // This request has started creating a course (its create_stage is under way).
+  const creatingInRequest = useWorkbenchStore((s) =>
+    s.chat
+      .slice(requestEpisodeStart(s.chat) + 1)
+      .some((node) => node.kind === 'tool' && node.toolName === 'create_stage'),
+  );
+  const pageCount = useWorkbenchStore((s) => Object.keys(s.pages).length);
+
+  /* ── The request preview tab ─────────────────────────────────────────────
+     One question decides the right pane for a request: which course is this
+     conversation working on (`lib/workbench/conversation-course.ts`)? A course
+     it already has — the one it was started beside, or the one an earlier
+     request made — is the pane, and there is no preview. A course the request
+     is making gets the preview tab, a regular tab in the right pane's strip
+     beside any course tabs (see `WorkspaceRequestActivity`); when that
+     course's first page is persisted, the same tab becomes the course tab, in
+     place. The preview takes focus when its request starts animating in it,
+     once per request and not on later events, so a teacher who switched to
+     another tab stays there. Closing it is remembered for that request
+     (`lib/workbench/preview-tab.ts`); folding it is the pane's own fold. */
+  const requestCourseJson = useWorkbenchStore((s) =>
+    JSON.stringify(requestCourse(s.chat, s.existingCourse, s.stageId)),
+  );
+  const thisRequestCourse = useMemo(
+    () => JSON.parse(requestCourseJson) as RequestCourse,
+    [requestCourseJson],
+  );
+  // Names the request, as the preview's own track does (`requestTrack`).
+  const requestKey = useWorkbenchStore(
+    (s) => s.chat[requestEpisodeStart(s.chat)]?.key ?? QUEUED_REQUEST_KEY,
+  );
+  const requestLive = ['running', 'queued', 'connecting'].includes(attachedSessionStatus);
+  const pagedCourses = thisRequestCourse.kind === 'new' ? thisRequestCourse.ready : [];
+  const workingCourseId = thisRequestCourse.kind === 'course' ? thisRequestCourse.courseId : null;
+  // Closed by the user — now, or in the tab memory a session-only refresh
+  // (which restores no tabs) leaves behind. The reader is SSR-safe.
+  const rememberedTabs = pagedCourses.length > 0 || workingCourseId ? readCourseTabsMemory() : null;
+  const closedTab = (id: string) =>
+    [courseTabs, rememberedTabs].some((tabs) => (tabs?.closedCourseIds ?? []).includes(id));
+  // A live request is writing its course; otherwise it must still exist.
+  const stillListed = (id: string) =>
+    requestLive ||
+    (courses.state === 'ready' && courses.classrooms.some((course) => course.id === id));
+  const openable = (id: string) =>
+    !courseTabs.courseIds.includes(id) && !closedTab(id) && stillListed(id);
+  /** The request's new courses with a first page and no tab yet, in the order their pages landed. */
+  const coursesToOpen = pagedCourses.filter(openable);
+  // The course the preview tab becomes: the first of the request's new courses with a page.
+  const previewCourseId = pagedCourses[0] ?? null;
+  const makingCourse =
+    thisRequestCourse.kind === 'new' &&
+    (previewCourseId === null || coursesToOpen.includes(previewCourseId));
+  // A conversation working on a course it has: an empty right pane shows that
+  // course. Only an empty one — a course on screen is the teacher's choice.
+  const courseToShow =
+    workingCourseId &&
+    openable(workingCourseId) &&
+    !courseTabs.activeCourseId &&
+    !panes.courseId &&
+    !render.view &&
+    !narrow
+      ? workingCourseId
+      : null;
+
+  const previewEligible =
+    !render.view && !narrow && makingCourse && panes.sessionId === attachedSessionId;
+  const [reportedPreviewTab, setPreviewTab] = useState<PreviewTabState>(NO_PREVIEW_TAB);
+  // The preview reports a render behind; a report from the previous
+  // conversation (whose request keys may repeat here) is no report.
+  const previewTab =
+    reportedPreviewTab.sessionId === attachedSessionId ? reportedPreviewTab : NO_PREVIEW_TAB;
+  const previewTabOpen = previewEligible && previewTab.shown;
+  // Which tab of the strip the preview is relative to, per conversation: the
+  // preview is the active tab, or a course tab is.
+  const [previewFocus, setPreviewFocus] = useState<{
+    sessionId: string | null;
+    active: boolean;
+    focusedKey: string | null;
+  }>({ sessionId: null, active: false, focusedKey: null });
+  if (previewFocus.sessionId !== attachedSessionId) {
+    setPreviewFocus({ sessionId: attachedSessionId, active: false, focusedKey: null });
+  }
+  if (
+    previewTabOpen &&
+    previewTab.live &&
+    previewTab.requestKey !== null &&
+    previewTab.requestKey !== previewFocus.focusedKey &&
+    previewFocus.sessionId === attachedSessionId
+  ) {
+    // A request started animating: the tab takes focus, once per request.
+    setPreviewFocus({ ...previewFocus, active: true, focusedKey: previewTab.requestKey });
+  }
+  useLayoutEffect(() => {
+    unfocusPreview.current = () => setPreviewFocus((current) => ({ ...current, active: false }));
+  }, []);
+  /** The preview is the tab on screen: it is active, or there is no course tab to show. */
+  const previewShowing = previewTabOpen && (previewFocus.active || !panes.courseId);
+
+  // Request keys come from per-session event sequences and collide across
+  // conversations, so the close is remembered with the conversation it was for.
+  const [closedPreview, setClosedPreview] = useState<{
+    readonly sessionId: string | null;
+    readonly key: string;
+  } | null>(null);
+  const closedPreviewKey =
+    closedPreview && closedPreview.sessionId === attachedSessionId ? closedPreview.key : null;
+  const closePreview = useCallback(
+    (key: string) => {
+      rememberPreviewClosed(attachedSessionId, key);
+      setClosedPreview({ sessionId: attachedSessionId, key });
+      setPreviewFocus((current) => ({ ...current, active: false }));
+    },
+    [attachedSessionId, setPreviewFocus],
+  );
+  // Closing the preview closed the tab its course would have become.
+  const previewClosed =
+    closedPreviewKey === requestKey ||
+    (coursesToOpen.length > 0 && isPreviewClosed(attachedSessionId, requestKey));
+  const paneSessionStageId = useMemo(
+    () => sessions.find((session) => session.id === panes.sessionId)?.stageId ?? null,
+    [panes.sessionId, sessions],
+  );
+  const paneSessionExistingCourse = useMemo(() => {
+    const flag = sessions.find((session) => session.id === panes.sessionId)?.existingCourse;
+    return typeof flag === 'boolean' ? flag : null;
+  }, [panes.sessionId, sessions]);
+
+  /**
+   * The pane follows the course the conversation is working on.
+   *
+   * The request's new course has its first page: the preview tab becomes the
+   * course tab — at the preview's place, the end of the strip, and on screen
+   * if the preview was. Not on screen (another tab chosen, a page covering
+   * the panes, a finished conversation reopened beside another course), the
+   * course joins the strip without taking focus. Further courses of the same
+   * request join the same way when their first pages land.
+   *
+   * A conversation working on a course it already has, opened with nothing
+   * in the right pane, shows that course there (in place of the URL it was
+   * opened at: it is where the conversation is, not a step of its own).
+   */
+  const coursesToOpenKey = coursesToOpen.join('|');
+  useEffect(() => {
+    if (attachedSessionReplaying) return;
+    if (!attachedSessionId || attachedSessionId !== panes.sessionId) return;
+    if (courseToShow) {
+      const next = openCourseTab(courseTabs, courseToShow);
+      courseTabsRef.current = next;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- the tab set follows the conversation's durable course facts
+      setCourseTabs(next);
+      persistCourseTabs(next);
+      navigateInBackground((current) => withCourse(current, courseToShow), 'replace');
+      return;
+    }
+    if (!coursesToOpenKey || previewClosed) return;
+    const ids = coursesToOpenKey.split('|');
+    const inPlace =
+      ids[0] === previewCourseId && !panes.view && (previewShowing || !courseTabs.activeCourseId);
+    if (!inPlace) {
+      openCourses(ids);
+      return;
+    }
+    const next = activateCourseTab(openCourseTabs(courseTabs, ids), ids[0]);
+    courseTabsRef.current = next;
+    setCourseTabs(next);
+    persistCourseTabs(next);
+    collapse.expandClassroom();
+    navigateInBackground((current) => withCourse(current, ids[0]), 'push');
+  }, [
+    attachedSessionId,
+    attachedSessionReplaying,
+    collapse,
+    courseTabs,
+    courseToShow,
+    coursesToOpenKey,
+    navigateInBackground,
+    openCourses,
+    panes.sessionId,
+    panes.view,
+    persistCourseTabs,
+    previewClosed,
+    previewCourseId,
+    previewShowing,
+  ]);
+
+  /**
+   * One LIVE first-seen course link that is not a course this request is
+   * making (those open at their first page, above), one tab/open action.
+   * Links rebuilt from a chat's history are transcript content, not
+   * right-pane navigation. Later links for a stage are inert, so a user who
+   * manually switches away is not pulled back.
+   *
+   * Immutable first-link history is reconciled against three durable facts:
+   * server-backed classrooms, remembered open tabs, and explicitly closed tabs.
+   * The replay baseline plus durable tab memory prevent a refresh or A -> B -> A
+   * navigation from opening related classrooms, reviving closed tabs, or
+   * replacing the remembered active tab. While the preview is up (or about to
+   * be, for a create_stage under way: its tab state lags the stream by a
+   * render), the links wait: the preview's course comes first.
+   */
+  const previewHolds = previewTabOpen || (previewEligible && creatingInRequest);
+  useEffect(() => {
+    if (previewHolds) return;
+    const open = createdCourseTabsToOpen({
+      sessionId: attachedSessionId === panes.sessionId ? panes.sessionId : null,
+      createdCourseIds: stageLinkStageIds.filter(
+        (id, index) => index >= replayedStageLinkCount && !createdThisRequest.includes(id),
+      ),
+      replayedCourseCount: 0,
+      availableCourseIds:
+        courses.state === 'ready' ? courses.classrooms.map((course) => course.id) : [],
+      openCourseIds: courseTabs.courseIds,
+      closedCourseIds: courseTabs.closedCourseIds ?? [],
+      replaying: attachedSessionReplaying,
+    });
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- live stage links are an external stream reconciled into the tab set
+    if (open.length > 0) openCourses(open);
+  }, [
+    attachedSessionId,
+    attachedSessionReplaying,
+    createdThisRequest,
+    courseTabs,
+    courses.classrooms,
+    courses.state,
+    stageLinkStageIds,
+    openCourses,
+    previewHolds,
+    panes.sessionId,
+    replayedStageLinkCount,
+  ]);
+
+  useGeneratedCourseDiscoverySync({
+    sessionId: attachedSessionId,
+    stageId: sessionStageId,
+    pageCount,
+    status: attachedSessionStatus,
+    libraryRevision,
+    reload: courses.reload,
+  });
+
+  useEffect(() => {
+    if (!panes.sessionId) {
+      detach();
+      return;
+    }
+    // The stage is looked up from the list when it is loaded, and filled by
+    // the meta fetch otherwise — a `?session=` deep link has neither yet, and
+    // the chat needs neither.
+    attach(panes.sessionId, paneSessionStageId, paneSessionExistingCourse);
+    // A rename can still be awaiting its PATCH (or the confirming list read)
+    // when the user leaves this chat and comes back. The detail GET started by
+    // the new attachment may overtake that PATCH, so preserve the client's
+    // unconfirmed decision even when the owner row has not reached the list.
+    // The object wrapper distinguishes a real clear (`title: null`) from no
+    // decision. Otherwise the owner row is the title bootstrap authority.
+    const mutation = ownerSessionClient.current?.getUnconfirmedSessionTitle(panes.sessionId);
+    const attached = sessionsRef.current.find((session) => session.id === panes.sessionId);
+    if (mutation) {
+      syncAttachedSessionTitle(panes.sessionId, mutation.title);
+    } else if (attached) {
+      // Apply even an equal null: the revision records that an owner title
+      // source exists, so an older detail response cannot fill it back in.
+      syncAttachedSessionTitle(attached.id, attached.title ?? null);
+    }
+  }, [panes.sessionId, paneSessionStageId, paneSessionExistingCourse, attach, detach]);
+
+  // Attachment is workspace-scoped view state. Clear it when the shell leaves
+  // the tree so a subsequent standalone `/classroom/:id` route cannot inherit
+  // hosted/edit intent from the previous SPA screen.
+  useEffect(
+    () => () => {
+      detach();
+    },
+    [detach],
+  );
+
+  useWorkbenchStream(panes.sessionId);
+
+  /**
+   * The empty conversation: a composer with no session behind it yet.
+   *
+   * `start` is the whole creation path, and it runs on the user's first message —
+   * mint an idle session, then deliver that message through the ordinary message
+   * endpoint so its materials, element refs and `@`-named courses are not a
+   * special case (see `lib/workbench/first-message-session`). Opening a course
+   * therefore starts no run until the user actually asks for something.
+   */
+  // A course not in the rail's list (someone else's, opened read-only) is
+  // named by the document loaded in the classroom pane.
+  const draftLoadedName = useStageStore((s) =>
+    draftCourseId && s.stage?.id === draftCourseId ? s.stage.name : null,
+  );
+  const draftConversation = useMemo(
+    () =>
+      draftCourseId
+        ? {
+            ownerKey: `draft:${draftCourseId}`,
+            // Opened for this course: its composer names it (see
+            // `draftNamesCourse`).
+            ...(draftNamesCourse
+              ? {
+                  course: {
+                    stageId: draftCourseId,
+                    title: draftCourseTitle({
+                      listedName: courses.classrooms.find((course) => course.id === draftCourseId)
+                        ?.name,
+                      loadedName: draftLoadedName,
+                      fallback: t('workspace.untitledCourse'),
+                    }),
+                  },
+                }
+              : {}),
+            start: async (message: {
+              readonly text: string;
+              readonly materials: readonly WorkbenchMaterial[];
+              readonly elementRefs: readonly ElementRef[];
+              readonly courseRefs: readonly CourseRef[];
+              readonly boundCourseId?: string;
+              readonly onCreated?: (sessionId: string) => void;
+            }) => {
+              const visitAtSend = draftVisit.current;
+              // The course mention the composer opened with, if still there,
+              // is the conversation's course; without it, an ordinary one.
+              const { boundCourseId, ...rest } = message;
+              const started = await startConversationWithFirstMessage({
+                ...(boundCourseId ? { stageId: boundCourseId } : {}),
+                ...rest,
+              });
+              // The rail should show the conversation that just came into being,
+              // and the URL is what attaches it.
+              loadSessions();
+              // Decided when the session exists, not when the message was
+              // sent: the teacher may have opened the knowledge base since.
+              // Anything else -- another conversation, another classroom, a
+              // new draft (a hand-over's, often under the same
+              // `draft:<course>` key) -- ended this draft's visit: the
+              // conversation stays in the rail, and attaching it would pull
+              // the teacher back and carry whatever they are typing now into it.
+              navigateInBackground(
+                (current) =>
+                  draftVisit.current === visitAtSend &&
+                  current.sessionId === null &&
+                  current.courseId === draftCourseId
+                    ? { ...current, sessionId: started.sessionId, courseId: draftCourseId }
+                    : null,
+                'replace',
+              );
+              return {
+                accepted: true,
+                elementRefsAccepted: started.elementRefsAccepted,
+                courseRefsAccepted: started.courseRefsAccepted,
+              };
+            },
+          }
+        : null,
+    [
+      courses.classrooms,
+      draftCourseId,
+      draftLoadedName,
+      draftNamesCourse,
+      loadSessions,
+      navigateInBackground,
+      t,
+    ],
+  );
+
+  // The owner list stream and attached conversation stream have independent
+  // clocks. Project the attached fold onto its own row so `session_end` removes
+  // the spinner even when that frame wins the race. The id fence matters during navigation:
+  // until attach() has switched the store, the previous chat must not lend its
+  // status to the newly selected row. Background rows stay server-owned.
+  const visibleSessions = useMemo(
+    () =>
+      reconcileAttachedSessionStatus(sessions, {
+        paneId: panes.sessionId,
+        attachedId: attachedSessionId,
+        status: attachedSessionStatus,
+        connected: attachedSessionConnected,
+        pendingWork: attachedSessionPendingWork,
+        awaitingAnswer: attachedSessionAwaitingAnswer,
+      }),
+    [
+      attachedSessionAwaitingAnswer,
+      attachedSessionConnected,
+      attachedSessionId,
+      attachedSessionPendingWork,
+      attachedSessionStatus,
+      panes.sessionId,
+      sessions,
+    ],
+  );
+
+  // Keep an observed status after the user leaves this chat. The owner event
+  // may still be in flight on its independent stream.
+  useEffect(() => {
+    ownerSessionClient.current?.updateSessions((current) => {
+      const reconciled = reconcileAttachedSessionStatus(current, {
+        paneId: panes.sessionId,
+        attachedId: attachedSessionId,
+        status: attachedSessionStatus,
+        connected: attachedSessionConnected,
+        pendingWork: attachedSessionPendingWork,
+        awaitingAnswer: attachedSessionAwaitingAnswer,
+      });
+      return reconciled;
+    });
+  }, [
+    attachedSessionAwaitingAnswer,
+    attachedSessionConnected,
+    attachedSessionId,
+    attachedSessionPendingWork,
+    attachedSessionStatus,
+    panes.sessionId,
+  ]);
+
+  /**
+   * A classroom has no session lifecycle. Its identity is the course id and
+   * its content is the latest document/manifest snapshot. Session status used
+   * to decide whether the pane skipped its own load; switching chats could
+   * therefore flip that gate for an unchanged course and reset the whole
+   * canvas. Freshness sync now simply complements the classroom's ordinary
+   * load, independent of which conversations happen to be running.
+   */
+  useStageFreshnessSync(panes.courseId);
+
+  // Leaving full-screen playback behind when the course closes: the flag is
+  // session state and would otherwise blank the next surface.
+  const setPlaybackOn = useWorkbenchStore((s) => s.setPlaybackOn);
+  useEffect(() => {
+    if (!panes.courseId && playbackOn) setPlaybackOn(false);
+  }, [panes.courseId, playbackOn, setPlaybackOn]);
+
+  // ── Read-only ─────────────────────────────────────────────────────────
+  // See `resolveCourseAccess` / `isCourseReadOnly`: the course list says whose
+  // a listed course is (a course saved from Discover is not the viewer's); a
+  // course NOT in the list (a link someone else copied) is asked about through
+  // the stage-meta sidecar, as the standalone classroom page does, and is
+  // read-only until it answers. A generation run still producing the course
+  // keeps it read-only too.
+  const listedCourse = useMemo(
+    () => courses.classrooms.find((course) => course.id === panes.courseId),
+    [courses.classrooms, panes.courseId],
+  );
+  // Listed: the list's own answer (a listed course with no flag is the viewer's).
+  const courseIsOwner = listedCourse ? listedCourse.isOwner !== false : undefined;
+  const [courseMeta, setCourseMeta] = useState<{
+    readonly courseId: string;
+    readonly meta: StageMetaResult;
+  } | null>(null);
+  const courseListed = courseIsOwner !== undefined;
+  useEffect(() => {
+    const courseId = panes.courseId;
+    if (!courseId || courseListed) return;
+    let current = true;
+    void fetchStageMeta(courseId).then((meta) => {
+      if (current) setCourseMeta({ courseId, meta });
+    });
+    return () => {
+      current = false;
+    };
+  }, [courseListed, panes.courseId]);
+  const activeCourseMeta =
+    courseMeta && courseMeta.courseId === panes.courseId ? courseMeta.meta : null;
+  const courseAccess = resolveCourseAccess({
+    listedIsOwner: courseIsOwner,
+    meta: activeCourseMeta,
+  });
+  // The workbench is for a course's owner. Someone else's course reached here
+  // (a `/workspace?course=` link copied from its owner's address bar) goes to
+  // its classroom page instead, replacing this entry so Back does not bounce
+  // between the two. Only a course the server answered for: one that does not
+  // exist keeps the classroom's own not-found, and one in the viewer's own list
+  // (saved from Discover) stays, read-only, where they put it. Read-only above
+  // is the safety net while the answer is on its way.
+  const router = useRouter();
+  const strangerCourseId =
+    !courseListed &&
+    panes.courseId &&
+    activeCourseMeta?.outcome === 'found' &&
+    !activeCourseMeta.meta.isOwner
+      ? panes.courseId
+      : null;
+  useEffect(() => {
+    if (!strangerCourseId) return;
+    router.replace(classroomHref(strangerCourseId));
+  }, [router, strangerCourseId]);
+  const courseGenerating = useStageStore((s) => s.courseGenerating);
+  const readOnlyCourse = isCourseReadOnly({
+    access: courseAccess,
+    generating: courseGenerating,
+  });
+  // The names of courses that are not in the list (someone else's), as their
+  // documents loaded here: a tab says what it is, not "untitled".
+  const loadedStageId = useStageStore((s) => s.stage?.id ?? null);
+  const loadedStageName = useStageStore((s) => s.stage?.name ?? '');
+  const [loadedCourseNames, setLoadedCourseNames] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
+  if (
+    loadedStageId &&
+    loadedStageName &&
+    loadedCourseNames.get(loadedStageId) !== loadedStageName
+  ) {
+    setLoadedCourseNames((names) => new Map(names).set(loadedStageId, loadedStageName));
+  }
+
+  /* ── What a course is CALLED ───────────────────────────────────────────
+     Tabs and in-chat links both need a name and a page count for an id, and
+     both must degrade rather than invent one. The authoritative list is the
+     rail's; a course the agent has only just created is not in it yet, so the
+     attached session's own title fills that one gap and everything else says
+     nothing at all (`null`), which the renderers show as "untitled" and as no
+     page count rather than as a fabricated zero. */
+  const courseTitle = useWorkbenchStore((s) => s.courseTitle);
+  // The built-in course goes by one product name everywhere (its card in My
+  // courses, its tab, the tour), whatever its document calls itself.
+  const lookupCourse = useCallback(
+    (courseId: string): WorkbenchCourseSummary | null => {
+      const known = courses.classrooms.find((course) => course.id === courseId);
+      if (known)
+        return {
+          id: courseId,
+          name: known.name,
+          pageCount: known.sceneCount,
+          updatedAt: known.updatedAt,
+        };
+      if (courseId === sessionStageId && courseTitle)
+        return { id: courseId, name: courseTitle, pageCount: null };
+      const loadedName = loadedCourseNames.get(courseId);
+      if (loadedName) return { id: courseId, name: loadedName, pageCount: null };
+      return null;
+    },
+    [courses.classrooms, courseTitle, loadedCourseNames, sessionStageId],
+  );
+
+  /**
+   * What the composer's `@` picker may offer: the rail's own list, newest
+   * first. Same source as `lookupCourse` — one list, so the picker, the tab and
+   * the rail can never disagree about what exists or what it is called.
+   */
+  const courseOptions = useMemo(
+    () =>
+      courses.classrooms
+        .filter((course) => !generatingCourseIds.has(course.id))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .map((course) => ({ id: course.id, name: course.name })),
+    [courses.classrooms, generatingCourseIds],
+  );
+
+  const courseTabItems = useMemo(
+    () =>
+      courseTabs.courseIds.map((id) => ({
+        id,
+        name: lookupCourse(id)?.name ?? '',
+      })),
+    [courseTabs.courseIds, lookupCourse],
+  );
+
+  /** A course tab chosen in the strip: the preview, if it was on screen, steps back. */
+  const activateCourseFromStrip = useCallback(
+    (courseId: string) => {
+      if (courseId === PREVIEW_TAB_ID) {
+        setPreviewFocus((current) => ({ ...current, active: true }));
+        return;
+      }
+      setPreviewFocus((current) => ({ ...current, active: false }));
+      activateCourse(courseId);
+    },
+    [activateCourse, setPreviewFocus],
+  );
+  const closeCourseFromStrip = useCallback(
+    (courseId: string) => {
+      if (courseId === PREVIEW_TAB_ID) {
+        if (previewTab.requestKey) closePreview(previewTab.requestKey);
+        return;
+      }
+      // The teacher closing a tab; `closeCourse` alone is also the end of a
+      // course deletion, which is not a navigation of theirs.
+      setMaterialSeed(null);
+      closeCourse(courseId);
+    },
+    [closeCourse, closePreview, previewTab.requestKey],
+  );
+
+  const classroomBrowser = useMemo(
+    () => ({
+      // One strip: the course tabs, then the preview tab while it is open.
+      tabs: previewTabOpen
+        ? [...courseTabItems, { id: PREVIEW_TAB_ID, name: previewTab.label }]
+        : courseTabItems,
+      // The mounted classroom always gets the real course: the preview tab
+      // only selects in the strip, so the keep-alive classroom behind it is
+      // never asked to load the sentinel.
+      activeCourseId: panes.courseId as string,
+      selectedTabId: previewShowing ? PREVIEW_TAB_ID : (panes.courseId as string),
+      onActivateCourse: activateCourseFromStrip,
+      onCloseCourse: closeCourseFromStrip,
+    }),
+    [
+      activateCourseFromStrip,
+      closeCourseFromStrip,
+      courseTabItems,
+      panes.courseId,
+      previewShowing,
+      previewTab.label,
+      previewTabOpen,
+    ],
+  );
+  const previewStrip = useMemo(
+    () => ({
+      tabs: courseTabItems,
+      onActivate: activateCourseFromStrip,
+      onCloseCourse: closeCourseFromStrip,
+    }),
+    [activateCourseFromStrip, closeCourseFromStrip, courseTabItems],
+  );
+
+  const courseNavigation = useMemo(
+    () => ({
+      openCourse,
+      activeCourseId: panes.courseId,
+      lookupCourse,
+      courseOptions,
+      generatingCourseIds,
+    }),
+    [courseOptions, generatingCourseIds, lookupCourse, openCourse, panes.courseId],
+  );
+
+  // The preview of the first request the home composer started on this page
+  // folds the navigation, once, as a view state: the teacher's saved rail
+  // preference is never written for it. See `homeRequest`.
+  const previewPaneOpen = previewShowing && !collapse.value.classroom;
+  // The preview became its course's tab, in place: the same thing being built
+  // is still what is on screen, so the fold holds through the handoff instead
+  // of the rail springing open when the first page lands.
+  const handedOffOnScreen =
+    homeRequest.requestKey !== null &&
+    previewCourseId !== null &&
+    panes.courseId === previewCourseId &&
+    classroomOpen &&
+    !collapse.value.classroom;
+  const homeSurfaceOpen = previewPaneOpen || handedOffOnScreen;
+  const homePreview =
+    homeRequest.sessionId !== null &&
+    homeRequest.sessionId === attachedSessionId &&
+    !homeRequest.used &&
+    (homeRequest.requestKey === null ||
+      homeRequest.requestKey === previewTab.requestKey ||
+      (homeRequest.requestKey === QUEUED_REQUEST_KEY && previewTab.requestKey !== null) ||
+      handedOffOnScreen);
+  if (
+    homePreview &&
+    previewPaneOpen &&
+    previewTab.requestKey &&
+    (homeRequest.requestKey === null ||
+      (homeRequest.requestKey === QUEUED_REQUEST_KEY &&
+        previewTab.requestKey !== QUEUED_REQUEST_KEY))
+  ) {
+    // The home request's preview is on screen: this is the one it folds for.
+    // A request first shown while queued is renamed by its opening bubble a
+    // moment later; it is the same request, and the fold follows it.
+    setHomeRequest({ ...homeRequest, requestKey: previewTab.requestKey });
+  }
+  if (homeRequest.requestKey !== null && !homeRequest.used && !(homePreview && homeSurfaceOpen)) {
+    // It left the screen (another tab, a fold, the next request, another
+    // conversation): the fold is spent, and showing it again leaves the rail be.
+    setHomeRequest({ ...homeRequest, used: true });
+  }
+  const autoFold = homePreview && homeSurfaceOpen && homeRequest.requestKey !== null;
+  const paneSteady = usePaneSteady(previewPaneOpen || (Boolean(panes.courseId) && classroomOpen));
+  const [navReopenedForPreview, setNavReopenedForPreview] = useState(false);
+  if (!autoFold && navReopenedForPreview) setNavReopenedForPreview(false);
+  const navCollapsed = collapse.value.nav || (autoFold && !navReopenedForPreview);
+  const toggleRail = useCallback(() => {
+    if (!autoFold) {
+      collapse.toggleNav();
+      return;
+    }
+    if (navCollapsed) {
+      // Reopened by hand: it stays open for this preview, and an open
+      // preference is remembered as one.
+      if (collapse.value.nav) collapse.toggleNav();
+      setNavReopenedForPreview(true);
+    } else {
+      setNavReopenedForPreview(false);
+    }
+  }, [autoFold, collapse, navCollapsed]);
+  // The rail fades in as it opens (the page loading, its fold button), but not
+  // when a drag unfolds it: that is the same gesture continuing under the
+  // pointer. The flag is set as the drag unfolds the rail and cleared only when
+  // the rail folds again, so it never changes under an expanded rail already
+  // on screen (which would replay the fade).
+  const [railUnfoldedByDrag, setRailUnfoldedByDrag] = useState(false);
+  const [railWasCollapsed, setRailWasCollapsed] = useState(navCollapsed);
+  if (railWasCollapsed !== navCollapsed) {
+    setRailWasCollapsed(navCollapsed);
+    if (navCollapsed && railUnfoldedByDrag) setRailUnfoldedByDrag(false);
+  }
+  // Dragging the rail's edge far enough inward folds it mid-drag, and the same
+  // drag carried back out unfolds it, through the same toggle as its fold
+  // button (so the preference is remembered the same way). The drag outlives
+  // the render that started it (the rail swaps under the pointer), so these
+  // read the rail's state through refs rather than a captured closure.
+  const railFold = useRef({ navCollapsed, toggleRail });
+  useEffect(() => {
+    railFold.current = { navCollapsed, toggleRail };
+  }, [navCollapsed, toggleRail]);
+  // One owner for both rail edges: the drag outlives the edge that started it,
+  // and is aborted only if the shell itself unmounts mid-drag.
+  const railDrag = useResizeDragOwner();
+  const collapseRail = useCallback(() => {
+    const fold = railFold.current;
+    if (fold.navCollapsed) return;
+    fold.navCollapsed = true;
+    fold.toggleRail();
+  }, []);
+  const expandRail = useCallback(() => {
+    const fold = railFold.current;
+    if (!fold.navCollapsed) return;
+    fold.navCollapsed = false;
+    setRailUnfoldedByDrag(true);
+    fold.toggleRail();
+  }, []);
+
+  return (
+    <div
+      ref={rootRef}
+      data-testid="pro-workspace"
+      data-ws-layout={
+        render.view
+          ? `view:${render.view}`
+          : render.home
+            ? 'home'
+            : `${chatOpen ? 'chat' : ''}${classroomOpen ? 'classroom' : ''}`
+      }
+      data-ws-pane-steady={paneSteady || undefined}
+      className="ws-root flex h-[100dvh] w-full overflow-hidden"
+      // The default only — the persisted width is applied to this same
+      // variable in a layout effect, so server and client markup agree.
+      style={{ ['--ws-rail-w' as string]: `${RAIL_WIDTH_DEFAULT}px` }}
+    >
+      {courses.importInput}
+
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+
+      {/* Mounted only while open, so every opening starts from an empty query. */}
+      {searchOpen ? (
+        <WorkspaceSearchPalette
+          open
+          onOpenChange={setSearchOpen}
+          sessions={visibleSessions}
+          courses={courses.classrooms}
+          folders={courses.folders}
+          onOpenSession={openSession}
+          onOpenCourse={browseCourse}
+          onOpenMaterial={openMaterial}
+          onNewSession={startNewConversation}
+          onOpenView={openView}
+          onOpenSettings={() => setSettingsOpen(true)}
+          coursesView={WORKSPACE_COURSES_VIEW}
+          libraryView={WORKSPACE_LIBRARY_VIEW}
+        />
+      ) : null}
+
+      {classroomOpen && playbackOn ? null : (
+        <WorkspaceRail
+          sessions={visibleSessions}
+          sessionState={sessionState}
+          onReloadSessions={() => {
+            loadSessions(true);
+          }}
+          activeSessionId={panes.sessionId}
+          collapsed={navCollapsed}
+          onToggleCollapsed={toggleRail}
+          fadeIn={!railUnfoldedByDrag}
+          onOpenSession={openSession}
+          onNewSession={startNewConversation}
+          onGoHome={goHome}
+          onSessionDeleted={handleSessionDeleted}
+          onRenameSession={renameSession}
+          onOpenSearch={() => setSearchOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenGuide={() => {
+            resetOnboarding('home');
+            goHome();
+          }}
+          activeView={render.view}
+          onOpenView={openView}
+          resizeHandle={
+            <ResizeHandle
+              testId="pro-rail-resize-handle"
+              label={t('workspace.resizeAria')}
+              edge="right"
+              current={railWidth.current}
+              clamp={clampRailWidth}
+              onPreview={railWidth.preview}
+              onCommit={railWidth.commit}
+              onReset={railWidth.reset}
+              collapseBelow={RAIL_COLLAPSE_THRESHOLD}
+              onCollapse={collapseRail}
+              onExpand={expandRail}
+              drag={railDrag}
+            />
+          }
+          miniResizeHandle={
+            <ResizeHandle
+              testId="pro-rail-mini-resize-handle"
+              label={t('workspace.expandNav')}
+              edge="right"
+              current={railWidth.current}
+              clamp={clampRailWidth}
+              onPreview={railWidth.preview}
+              onCommit={railWidth.commit}
+              onReset={() => {}}
+              folded
+              collapseBelow={RAIL_COLLAPSE_THRESHOLD}
+              onCollapse={collapseRail}
+              onExpand={expandRail}
+              drag={railDrag}
+            />
+          }
+        />
+      )}
+
+      {chatTab ? (
+        <PaneTab
+          testId="workspace-chat-reopen"
+          label={t('workspace.expandChat')}
+          onClick={focusChat}
+        />
+      ) : null}
+
+      {chatOpen || chatMounted ? (
+        <WorkspaceChatPane
+          hidden={!chatOpen}
+          covered={render.view !== null}
+          fill={chatFills && !previewPaneOpen}
+          width={chatWidth.value}
+          navigation={courseNavigation}
+          materialSeed={materialSeed}
+          onMaterialSeedConsumed={consumeMaterialSeed}
+          newConversation={composerReset}
+          conversation={panes.sessionId ?? (draftCourseId ? `draft:${draftCourseId}` : null)}
+          draftConversation={draftConversation}
+          onRename={
+            // Only a conversation that exists can be named. A draft one has no
+            // id to PATCH — its first message mints the session, and the title
+            // it derives from that message is nameable from then on.
+            attachedSessionId
+              ? (title: string) => renameSession(attachedSessionId, title)
+              : undefined
+          }
+          // Folding is offered only while the classroom is there to take the
+          // column: see `resolveWorkspaceRender`, which refuses to fold the last
+          // visible pane anyway.
+          onCollapse={bothPanesOnScreen ? collapse.collapseChat : undefined}
+          resizeHandle={
+            bothPanesOnScreen || previewPaneOpen ? (
+              <ResizeHandle
+                testId="workspace-chat-resize-handle"
+                label={t('workspace.resizeChatAria')}
+                edge="right"
+                current={chatWidth.current}
+                clamp={clampChatWidth}
+                onPreview={chatWidth.preview}
+                onCommit={chatWidth.commit}
+                onReset={chatWidth.reset}
+              />
+            ) : undefined
+          }
+        />
+      ) : null}
+
+      {previewEligible ? (
+        <WorkspaceRequestActivity
+          onStateChange={setPreviewTab}
+          hidden={!previewShowing || collapse.value.classroom}
+          onCollapse={collapse.collapseClassroom}
+          closedKey={closedPreviewKey}
+          onClose={closePreview}
+          strip={previewStrip}
+        />
+      ) : null}
+
+      {previewTabOpen && !panes.courseId && collapse.value.classroom ? (
+        <PaneTab
+          testId="workspace-preview-reopen"
+          label={t('workspace.expandClassroom')}
+          side="right"
+          onClick={collapse.expandClassroom}
+        />
+      ) : null}
+
+      {panes.courseId ? (
+        <WorkspaceClassroomPane
+          browser={classroomBrowser}
+          hidden={!classroomOpen || previewShowing}
+          readOnly={readOnlyCourse}
+          // Not known yet is read-only too, but says nothing until it is known.
+          readOnlyKnown={courseAccess !== 'unknown'}
+          fullscreen={playbackOn}
+          // Symmetric with the conversation's fold: offered only while both
+          // panes are on screen (the last visible pane cannot fold — see
+          // `resolveWorkspaceRender`). Its button lives in the pane's own header.
+          onCollapse={bothPanesOnScreen ? collapse.collapseClassroom : undefined}
+          onTalkAboutCourse={browsingCourse && !readOnlyCourse ? talkAboutCourseStable : undefined}
+        />
+      ) : null}
+
+      {classroomTab ? (
+        <PaneTab
+          testId="workspace-classroom-reopen"
+          label={t('workspace.expandClassroom')}
+          side="right"
+          onClick={focusClassroom}
+        />
+      ) : null}
+
+      {render.home ? (
+        <WorkspaceHome
+          composerReset={composerReset}
+          // The home composer's `@` picker names courses from the same one list
+          // the rail and the conversation composer use.
+          courseOptions={courseOptions}
+          onOpenSession={openCreatedSession}
+          onOpenSessionAfterLeaving={openCreatedSessionAfterLeaving}
+          materialSeed={materialSeed}
+          onMaterialSeedConsumed={consumeMaterialSeed}
+          promptSeed={promptSeeds.seed}
+          onPromptSeedConsumed={promptSeeds.consume}
+        />
+      ) : null}
+
+      {/* A page covers the main area: the knowledge base, my courses, or a
+          host page. The conversation and classroom panes above stay mounted,
+          hidden (`render` turns both off), so leaving the page finds them as
+          they were and the run's stream is never detached. */}
+      {render.view === WORKSPACE_LIBRARY_VIEW ? (
+        <MaterialLibraryPage
+          onChatWithMaterial={chatWithMaterial}
+          onLeave={leaveView}
+          locate={locatedMaterial}
+        />
+      ) : render.view === WORKSPACE_COURSES_VIEW ? (
+        <WorkspaceCoursesPage
+          courses={courses}
+          courseRuns={courseRuns}
+          pendingRuns={pendingRuns}
+          onOpenCourse={browseCourse}
+          onDeleteCourse={handleCourseDeleted}
+          onMakeCourse={goHome}
+          onDiscardRun={discardPendingRun}
+        />
+      ) : render.view ? (
+        <main
+          data-testid={`workspace-host-view-${render.view}`}
+          className="ws-canvas relative flex min-w-0 flex-1 flex-col overflow-y-auto"
+        >
+          {hostPages.get(render.view)?.render?.()}
+        </main>
+      ) : null}
+
+      {showTour && tourSteps.length > 0 ? (
+        <WorkspaceTour
+          steps={tourSteps}
+          onNavigate={tourNavigate}
+          onEnd={endTour}
+          onSendExample={sendTourExample}
+          onStart={() => setTourRunning(true)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/* ── Pane collapse ────────────────────────────────────────────────────────
+   A viewing preference, not a location: it is remembered in `localStorage`
+   and deliberately never travels in a shared link. Read in a layout effect
+   rather than during render, because `localStorage` does not exist on the
+   server and reading it in an initializer is a hydration mismatch. The rail's
+   default is the exception that needs no storage: it comes from the entry
+   panes, which the server sees too, so the first paint already has it. */
+
+interface PaneCollapseState {
+  readonly value: { readonly nav: boolean; readonly chat: boolean; readonly classroom: boolean };
+  readonly toggleNav: () => void;
+  readonly collapseChat: () => void;
+  readonly expandChat: () => void;
+  readonly collapseClassroom: () => void;
+  readonly expandClassroom: () => void;
+}
+
+function usePaneCollapse(navDefault: boolean): PaneCollapseState {
+  const [nav, setNav] = useState(navDefault);
+  const [chat, setChat] = useState(false);
+  const [classroom, setClassroom] = useState(false);
+
+  useLayoutEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect -- storage is client-only; see the block comment above */
+    setNav(parseCollapsed(readFlag(NAV_COLLAPSED_STORAGE_KEY), navDefault));
+    setChat(parseCollapsed(readFlag(CHAT_COLLAPSED_STORAGE_KEY)));
+    setClassroom(parseCollapsed(readFlag(CLASSROOM_COLLAPSED_STORAGE_KEY)));
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [navDefault]);
+
+  const value = useMemo(() => ({ nav, chat, classroom }), [nav, chat, classroom]);
+  const toggleNav = useCallback(
+    () =>
+      setNav((current) => {
+        writeFlag(NAV_COLLAPSED_STORAGE_KEY, !current);
+        return !current;
+      }),
+    [],
+  );
+  const collapseChat = useCallback(() => {
+    writeFlag(CHAT_COLLAPSED_STORAGE_KEY, true);
+    setChat(true);
+  }, []);
+  const expandChat = useCallback(() => {
+    writeFlag(CHAT_COLLAPSED_STORAGE_KEY, false);
+    setChat(false);
+  }, []);
+  const collapseClassroom = useCallback(() => {
+    writeFlag(CLASSROOM_COLLAPSED_STORAGE_KEY, true);
+    setClassroom(true);
+  }, []);
+  const expandClassroom = useCallback(() => {
+    writeFlag(CLASSROOM_COLLAPSED_STORAGE_KEY, false);
+    setClassroom(false);
+  }, []);
+
+  return useMemo(
+    () => ({
+      value,
+      toggleNav,
+      collapseChat,
+      expandChat,
+      collapseClassroom,
+      expandClassroom,
+    }),
+    [collapseChat, collapseClassroom, expandChat, expandClassroom, toggleNav, value],
+  );
+}
+
+function readFlag(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeFlag(key: string, collapsed: boolean): void {
+  try {
+    localStorage.setItem(key, collapsed ? '1' : '0');
+  } catch {
+    // Storage can be denied (private mode, blocked cookies). An unwritable
+    // store costs the preference, not the session.
+  }
+}
+
+/* ── Widths ───────────────────────────────────────────────────────────────
+   Both resizable columns work the same way: the width is a CSS variable and
+   NOTHING else — no React state. A drag writes the variable straight onto the
+   node, so a tree of rows never re-renders mid-drag; that is the difference
+   between a column that tracks the cursor and one that lags it.
+
+   Keeping it out of state also keeps hydration honest: the server always
+   renders the default, and the persisted value is applied in a layout effect
+   (before paint, after hydration) rather than read during render. */
+
+interface DraggableWidth {
+  readonly preview: (width: number) => void;
+  readonly commit: (width: number) => void;
+  readonly reset: () => void;
+  readonly current: () => number;
+}
+
+function useRailWidth(rootRef: React.RefObject<HTMLDivElement | null>): DraggableWidth {
+  const widthRef = useRef(RAIL_WIDTH_DEFAULT);
+
+  const paint = useCallback(
+    (next: number) => {
+      widthRef.current = next;
+      rootRef.current?.style.setProperty('--ws-rail-w', `${next}px`);
+    },
+    [rootRef],
+  );
+
+  const persist = useCallback((next: number) => {
+    try {
+      localStorage.setItem(RAIL_WIDTH_STORAGE_KEY, String(next));
+    } catch {
+      // See `usePaneCollapse` — an unwritable store costs the preference.
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    const restored = parseRailWidth(readFlag(RAIL_WIDTH_STORAGE_KEY));
+    if (restored !== RAIL_WIDTH_DEFAULT) paint(restored);
+  }, [paint]);
+
+  return {
+    preview: paint,
+    current: useCallback(() => widthRef.current, []),
+    commit: useCallback(
+      (next: number) => {
+        const clamped = clampRailWidth(next);
+        paint(clamped);
+        persist(clamped);
+      },
+      [paint, persist],
+    ),
+    reset: useCallback(() => {
+      paint(RAIL_WIDTH_DEFAULT);
+      persist(RAIL_WIDTH_DEFAULT);
+    }, [paint, persist]),
+  };
+}
+
+/**
+ * The conversation pane's width. Unlike the rail's, this one IS state: the
+ * pane is a flex sibling whose width feeds the classroom's remaining space,
+ * and a CSS variable would have to be read back by the layout anyway. The
+ * drag still paints through a ref so the intermediate frames do not
+ * re-render the chat.
+ */
+function useChatWidth(): DraggableWidth & { readonly value: number } {
+  const [value, setValue] = useState(CHAT_WIDTH_DEFAULT);
+  const widthRef = useRef(CHAT_WIDTH_DEFAULT);
+
+  useLayoutEffect(() => {
+    const restored = parseChatWidth(readFlag(CHAT_WIDTH_STORAGE_KEY));
+    widthRef.current = restored;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- storage is client-only
+    if (restored !== CHAT_WIDTH_DEFAULT) setValue(restored);
+  }, []);
+
+  const paint = useCallback((next: number) => {
+    widthRef.current = next;
+    setValue(next);
+  }, []);
+
+  return {
+    value,
+    preview: paint,
+    current: useCallback(() => widthRef.current, []),
+    commit: useCallback(
+      (next: number) => {
+        const clamped = clampChatWidth(next);
+        paint(clamped);
+        try {
+          localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(clamped));
+        } catch {
+          // See above.
+        }
+      },
+      [paint],
+    ),
+    reset: useCallback(() => {
+      paint(CHAT_WIDTH_DEFAULT);
+      try {
+        localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(CHAT_WIDTH_DEFAULT));
+      } catch {
+        // See above.
+      }
+    }, [paint]),
+  };
+}
